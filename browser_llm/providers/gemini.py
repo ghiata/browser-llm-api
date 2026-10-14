@@ -51,7 +51,14 @@ _GET_IMAGES_JS = """
       const by=new Uint8Array(buf); let s=''; const CH=0x8000;
       for(let i=0;i<by.length;i+=CH){ s+=String.fromCharCode.apply(null, by.subarray(i,i+CH)); }
       out.push({mime:b.type||'image/jpeg', b64:btoa(s), alt:(im.alt||'').replace(/^[,\\s]+/,'').trim()});
-    }catch(e){ /* skip unreadable image */ }
+    }catch(e){
+      // fetch(blob:) can fail on current Gemini pages; the image itself is loaded, so redraw it.
+      try{
+        const c=document.createElement('canvas'); c.width=im.naturalWidth; c.height=im.naturalHeight;
+        c.getContext('2d').drawImage(im,0,0);
+        out.push({mime:'image/png', b64:c.toDataURL('image/png').split(',')[1], alt:(im.alt||'').replace(/^[,\\s]+/,'').trim()});
+      }catch(e2){ /* skip unreadable image */ }
+    }
   }
   return JSON.stringify(out);
 })()
@@ -60,7 +67,7 @@ _GET_IMAGES_JS = """
 
 class GeminiProvider(Provider):
     name = "gemini-browser"
-    chat_url = "https://gemini.google.com/app"
+    chat_url = "https://gemini.google.com/app?hl=en"
     profile_dir = "./gemini_profile"
     stream_url_fragments = ["streamGenerateContent", "GenerateContent", "BardFrontendService"]
     # Google's authenticated-session cookie — only set after full sign-in, so
@@ -71,7 +78,7 @@ class GeminiProvider(Provider):
     supports_images = True
     image_text_is_caption = False  # Gemini's image-prompt prose is "thinking" chrome
     input_selector = 'div[contenteditable="true"]'
-    send_selectors = ['button[aria-label="Send message"]']
+    send_selectors = ['button[aria-label="Send message"]', 'button[aria-label="Kirim pesan"]']
     user_turn_selector = 'user-query'  # the submitted prompt's own element, beside model-response
     load_wait = 6.0
     # --- image input (upload). Gemini keeps NO <input type="file"> in the DOM at

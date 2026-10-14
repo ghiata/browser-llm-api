@@ -169,6 +169,15 @@ _CLICK_ALTS_JS = """
 """
 
 
+# Same lookup, but report the element's centre instead of clicking it: a real
+# (CDP mouse) click carries the user activation that Chrome demands before it
+# will open a file chooser, which a scripted el.click() does not.
+_LOCATE_ALTS_JS = _CLICK_ALTS_JS.replace(
+    "el.click(); return alt;",
+    "const r = el.getBoundingClientRect(); "
+    "return JSON.stringify({alt: alt, x: r.x + r.width / 2, y: r.y + r.height / 2});")
+
+
 async def eval_handle(page, expression: str):
     """``Runtime.evaluate`` returning the raw RemoteObject (no deep
     serialization), so a DOM element's ``objectId`` can be handed to CDP DOM
@@ -700,6 +709,20 @@ class Provider(ABC):
                     await asyncio.wait_for(opened.wait(), timeout=3.0)
                 except asyncio.TimeoutError:
                     pass  # not the final step, or the menu is still animating
+            if not opened.is_set():
+                # The scripted clicks did not open it; retry the last step with a real click.
+                try:
+                    raw = await page.evaluate(_LOCATE_ALTS_JS % json.dumps(list(self.attach_click_path[-1])))
+                    if isinstance(raw, str):
+                        pos = json.loads(raw)
+                        x, y = pos["x"], pos["y"]
+                        await page.send(cdp.input_.dispatch_mouse_event(type_="mouseMoved", x=x, y=y))
+                        for kind in ("mousePressed", "mouseReleased"):
+                            await page.send(cdp.input_.dispatch_mouse_event(
+                                type_=kind, x=x, y=y, button=cdp.input_.MouseButton.LEFT, click_count=1))
+                        logger.info(f"[{self.name}] attach: real click on {pos['alt']}")
+                except Exception as e:
+                    logger.warning(f"[{self.name}] real-click fallback failed: {e}")
             if not opened.is_set():
                 try:
                     await asyncio.wait_for(opened.wait(), timeout=10.0)
