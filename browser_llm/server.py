@@ -832,6 +832,24 @@ def _build_prompt(messages: list[Message]) -> tuple[str, list[str]]:
 
 _BASE_DEADLINE = 420.0   # base ceiling; long image gen on the free tier is slow
 _MAX_DEADLINE = 900.0    # hard cap even for an answer that keeps actively streaming
+# GPT-6 at High can think for over seven minutes with no answer text growing and
+# no WebSocket frames while the page still shows it working (Stop button, turn
+# in_progress). Such a request may wait up to this cap; a page that stopped
+# working still gives up near _BASE_DEADLINE.
+_THINKING_DEADLINE = max(_MAX_DEADLINE,
+                         float(os.environ.get("BROWSER_LLM_THINKING_DEADLINE", "1500")))
+
+
+def _extended_deadline(start, deadline, *, streaming, generating):
+    """The new deadline when the current one is reached, or None to give up.
+
+    Extends in 120 s steps while the answer is still in flight: text or frames
+    still arriving (up to ``_MAX_DEADLINE``), or the page still showing that it
+    is generating (up to ``_THINKING_DEADLINE``)."""
+    cap = start + (_THINKING_DEADLINE if generating else _MAX_DEADLINE)
+    if (streaming or generating) and deadline < cap:
+        return min(cap, deadline + 120.0)
+    return None
 
 
 async def _stream_completion(provider, page, monitor) -> AsyncGenerator[str, None]:
@@ -842,11 +860,13 @@ async def _stream_completion(provider, page, monitor) -> AsyncGenerator[str, Non
     loop only polls the page, feeds samples in, and yields chunks. Long answers
     (e.g. a whole HTML page) that are *still actively streaming* extend the
     deadline up to ``_MAX_DEADLINE`` so they aren't truncated mid-generation,
+    and a long silent thinking phase extends it up to ``_THINKING_DEADLINE``,
     while a stalled request still gives up near ``_BASE_DEADLINE``.
     """
     tracker = CompletionTracker()
     start = time.monotonic()
     deadline = start + _BASE_DEADLINE
+    generating = False
     # Some providers' extracted text reshapes near the end (see
     # Provider.buffered_stream); for those we suppress incremental deltas and
     # emit the final authoritative text once, so append-only SSE stays correct.
@@ -856,12 +876,18 @@ async def _stream_completion(provider, page, monitor) -> AsyncGenerator[str, Non
         now = time.monotonic()
         if now >= deadline:
             # Extend only while the answer is plainly still in flight — text
-            # still growing, or WebSocket frames still arriving (ChatGPT).
+            # still growing, WebSocket frames still arriving (ChatGPT), or the
+            # page still showing it is generating (a long thinking phase).
             ws_idle = monitor.seconds_since_ws_frame(now)
-            active = (tracker.silent_for(now) < 5.0
-                      or (ws_idle is not None and ws_idle < CompletionTracker.WS_ACTIVE_WINDOW))
-            if active and deadline < start + _MAX_DEADLINE:
-                deadline = min(start + _MAX_DEADLINE, deadline + 120.0)
+            streaming = (tracker.silent_for(now) < 5.0
+                         or (ws_idle is not None and ws_idle < CompletionTracker.WS_ACTIVE_WINDOW))
+            extended = _extended_deadline(start, deadline, streaming=streaming,
+                                          generating=generating)
+            if extended is not None:
+                if generating and not streaming:
+                    logger.info(f"[{provider.name}] still generating at {now - start:.0f}s "
+                                f"with no new text; waiting (cap {_THINKING_DEADLINE:.0f}s)")
+                deadline = extended
             else:
                 logger.warning(
                     f"[{provider.name}] completion deadline reached "
@@ -877,6 +903,7 @@ async def _stream_completion(provider, page, monitor) -> AsyncGenerator[str, Non
         raw = await provider.get_response_text(page)
         img = await provider.image_status(page)
         is_gen = await provider.is_generating(page)
+        generating = bool(is_gen)
         cdp_done = monitor.stream_done.is_set()
         # Only needed until the answer shows any sign of life (see "nostart").
         submitted = None if tracker.started else await provider.has_user_turn(page)

@@ -211,7 +211,8 @@ Everything downstream (`_stream_completion`, `run_chat`, `drive_once`, image per
    `SILENT_PLACEHOLDER_DONE`, 45s, while a placeholder shows). Failure outcome `nostart`: nothing on the page for
    `NOT_STARTED_TIMEOUT` (60s) after sending raises an error. `open_and_send` first calls
    `ensure_visible()`. The HTTP stream signal (`cdp_fired`) is informational only. Deadline 420s, extended up to 900s while
-   the answer is still streaming. Then `get_images()` runs and images are `_persist()`ed.
+   the answer is still streaming, and up to `BROWSER_LLM_THINKING_DEADLINE` (1500s) while the page still shows it
+   generating with no new text (GPT-6 High can think silently for over seven minutes; tests/test_deadline.py). Then `get_images()` runs and images are `_persist()`ed.
 8. The tab is **left open on purpose**: closing or navigating away destabilises the browser.
 
 ## Image input (vision + image-to-image)
