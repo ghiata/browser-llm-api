@@ -227,12 +227,12 @@ class GuestChat(unittest.IsolatedAsyncioTestCase):
     def tearDown(self):
         self.dir.cleanup()
 
-    async def chat(self, guest, imgs=()):
+    async def chat(self, guest, imgs=(), timeout=None):
         async def drive(provider, prompt, specs, **k):
             self.seen.update(prompt=prompt, **k)
             return "hello", [dict(i) for i in imgs]
         req = server.ChatCompletionRequest(messages=[{"role": "user", "content": "draw a cat"}],
-                                           ephemeral=False)
+                                           ephemeral=False, timeout=timeout)
         request = SimpleNamespace(state=SimpleNamespace(guest=guest))
         with mock.patch.object(server, "drive_once", drive), \
                 mock.patch.object(server, "QUOTA", self.quota), \
@@ -252,6 +252,13 @@ class GuestChat(unittest.IsolatedAsyncioTestCase):
         self.quota.commit(self.guest, ["earlier.png"])
         await self.chat(self.guest)
         self.assertTrue(self.seen["prompt"].startswith(server._WORDS_ONLY))
+
+    async def test_a_guest_cannot_set_its_own_timeout(self):
+        # EBE-7813: one guest request must not hold the shared tab for an hour.
+        await self.chat(self.guest, timeout=3600)
+        self.assertIsNone(self.seen["timeout"])
+        await self.chat(None, timeout=3600)
+        self.assertEqual(self.seen["timeout"], 3600)
 
     async def test_the_owner_chat_is_untouched(self):
         await self.chat(None)

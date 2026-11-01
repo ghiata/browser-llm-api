@@ -212,7 +212,11 @@ Everything downstream (`_stream_completion`, `run_chat`, `drive_once`, image per
    `NOT_STARTED_TIMEOUT` (60s) after sending raises an error. `open_and_send` first calls
    `ensure_visible()`. The HTTP stream signal (`cdp_fired`) is informational only. Deadline 420s, extended up to 900s while
    the answer is still streaming, and up to `BROWSER_LLM_THINKING_DEADLINE` (1500s) while the page still shows it
-   generating with no new text (GPT-6 High can think silently for over seven minutes; tests/test_deadline.py). Then `get_images()` runs and images are `_persist()`ed.
+   generating with no new text (GPT-6 High can think silently for over seven minutes; tests/test_deadline.py); a chat
+   request's own `timeout` replaces that cap and may lower the 420 s base, never the streaming cap (`_request_caps`,
+   30 to 3600 s); an image request without one keeps 420 s silent and 900 s streaming; a guest key's `timeout`
+   is ignored. A caller that gives up while queued still takes the browser when its turn comes:
+   `request.is_disconnected()` always reads False behind the `@app.middleware("http")` key check. Then `get_images()` runs and images are `_persist()`ed.
 8. The tab is **left open on purpose**: closing or navigating away destabilises the browser.
 
 ## Image input (vision + image-to-image)

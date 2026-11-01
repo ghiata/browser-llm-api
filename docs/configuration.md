@@ -30,6 +30,7 @@ cp .env.example .env      # then edit
 | `BROWSER_LLM_PUBLIC_URL` | `http://localhost:8081` | base of the image links the API returns; set it to this machine's address when others use the links |
 | `BROWSER_LLM_EPHEMERAL` | `0` | delete every chat's conversation afterwards unless the request says otherwise |
 | `BROWSER_LLM_THINKING_DEADLINE` | `1500` | seconds a request may wait while the page still shows the model working with no new text (a long thinking phase); never below the 900 s streaming cap |
+| `BROWSER_LLM_MAX_REQUEST_TIMEOUT` | `3600` | the most a chat request's own `timeout` may ask for; never below `BROWSER_LLM_THINKING_DEADLINE` |
 | `BROWSER_LLM_PREWARM` | `1` | start the default provider's browser at startup; `0` starts none until a request needs one |
 | `BROWSER_RECYCLE_AFTER_IMAGES` | `8` | restart a provider's browser after this many images |
 | `MAX_ATTACHMENTS` | `6` | most images one request may attach |

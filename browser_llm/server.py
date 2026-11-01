@@ -43,6 +43,7 @@ Example provider entry for an OpenAI-compatible client:
 import asyncio
 import base64
 import json
+import math
 import os
 import re
 import shutil
@@ -380,6 +381,12 @@ class ChatCompletionRequest(BaseModel):
     # this request, e.g. "instant", "GPT-6/medium" (ChatGPT; see
     # providers/chatgpt.py parse_variant). Unset = CHATGPT_MODEL/CHATGPT_EFFORT.
     model_variant: Optional[str] = None
+    # Not OpenAI: the most seconds this request may run once it has the
+    # browser (queue time not counted) while the page still shows the model
+    # thinking or answering. Unset = BROWSER_LLM_THINKING_DEADLINE (1500 s);
+    # clamped to 30..BROWSER_LLM_MAX_REQUEST_TIMEOUT (3600 s). A page that
+    # stopped working still gives up near 420 s.
+    timeout: Optional[float] = None
 
 
 class ConversationDeleteRequest(BaseModel):
@@ -838,21 +845,49 @@ _MAX_DEADLINE = 900.0    # hard cap even for an answer that keeps actively strea
 # working still gives up near _BASE_DEADLINE.
 _THINKING_DEADLINE = max(_MAX_DEADLINE,
                          float(os.environ.get("BROWSER_LLM_THINKING_DEADLINE", "1500")))
+# The most a request's own ``timeout`` may ask for, and the least (a smaller
+# value is raised to this so a typo cannot cut every answer short).
+_REQUEST_TIMEOUT_MAX = max(_THINKING_DEADLINE,
+                           float(os.environ.get("BROWSER_LLM_MAX_REQUEST_TIMEOUT", "3600")))
+_REQUEST_TIMEOUT_MIN = 30.0
 
 
-def _extended_deadline(start, deadline, *, streaming, generating):
+def _request_caps(timeout: Optional[float] = None) -> tuple[float, float, float]:
+    """(base, streaming cap, thinking cap) in seconds for one request.
+
+    Unset ``timeout`` keeps the server's defaults. A caller's ``timeout``
+    (clamped to ``_REQUEST_TIMEOUT_MIN``..``_REQUEST_TIMEOUT_MAX``) becomes the
+    cap for a silent thinking phase and may lower the base; an answer whose
+    text is still arriving keeps the streaming cap, so a short ``timeout`` never
+    cuts a long answer mid-stream (second review, EBE-7813)."""
+    if timeout is None or not math.isfinite(float(timeout)):
+        return _BASE_DEADLINE, _MAX_DEADLINE, _THINKING_DEADLINE
+    t = min(max(float(timeout), _REQUEST_TIMEOUT_MIN), _REQUEST_TIMEOUT_MAX)
+    return min(_BASE_DEADLINE, t), _MAX_DEADLINE, t
+
+
+def _extended_deadline(start, deadline, *, streaming, generating,
+                       stream_cap=None, think_cap=None):
     """The new deadline when the current one is reached, or None to give up.
 
     Extends in 120 s steps while the answer is still in flight: text or frames
-    still arriving (up to ``_MAX_DEADLINE``), or the page still showing that it
-    is generating (up to ``_THINKING_DEADLINE``)."""
-    cap = start + (_THINKING_DEADLINE if generating else _MAX_DEADLINE)
+    still arriving (up to ``stream_cap``, default ``_MAX_DEADLINE``, or the
+    thinking cap when that is longer and the page is generating), or the page
+    silent but still showing that it is generating (up to ``think_cap``,
+    default ``_THINKING_DEADLINE``)."""
+    stream_cap = _MAX_DEADLINE if stream_cap is None else stream_cap
+    think_cap = _THINKING_DEADLINE if think_cap is None else think_cap
+    if streaming:
+        cap = start + (max(think_cap, stream_cap) if generating else stream_cap)
+    else:
+        cap = start + think_cap
     if (streaming or generating) and deadline < cap:
         return min(cap, deadline + 120.0)
     return None
 
 
-async def _stream_completion(provider, page, monitor) -> AsyncGenerator[str, None]:
+async def _stream_completion(provider, page, monitor,
+                             timeout: Optional[float] = None) -> AsyncGenerator[str, None]:
     """
     Poll the response, yielding text deltas as they grow; return when complete.
 
@@ -861,11 +896,17 @@ async def _stream_completion(provider, page, monitor) -> AsyncGenerator[str, Non
     (e.g. a whole HTML page) that are *still actively streaming* extend the
     deadline up to ``_MAX_DEADLINE`` so they aren't truncated mid-generation,
     and a long silent thinking phase extends it up to ``_THINKING_DEADLINE``,
-    while a stalled request still gives up near ``_BASE_DEADLINE``.
+    while a stalled request still gives up near ``_BASE_DEADLINE``. A request's
+    own ``timeout`` replaces the thinking cap and bounds the rest (see
+    ``_request_caps``).
     """
     tracker = CompletionTracker()
     start = time.monotonic()
-    deadline = start + _BASE_DEADLINE
+    base, stream_cap, think_cap = _request_caps(timeout)
+    if timeout is not None:
+        logger.info(f"[{provider.name}] request timeout {think_cap:.0f}s "
+                    f"(asked {float(timeout):.0f}s)")
+    deadline = start + base
     generating = False
     # Some providers' extracted text reshapes near the end (see
     # Provider.buffered_stream); for those we suppress incremental deltas and
@@ -882,11 +923,12 @@ async def _stream_completion(provider, page, monitor) -> AsyncGenerator[str, Non
             streaming = (tracker.silent_for(now) < 5.0
                          or (ws_idle is not None and ws_idle < CompletionTracker.WS_ACTIVE_WINDOW))
             extended = _extended_deadline(start, deadline, streaming=streaming,
-                                          generating=generating)
+                                          generating=generating,
+                                          stream_cap=stream_cap, think_cap=think_cap)
             if extended is not None:
                 if generating and not streaming:
                     logger.info(f"[{provider.name}] still generating at {now - start:.0f}s "
-                                f"with no new text; waiting (cap {_THINKING_DEADLINE:.0f}s)")
+                                f"with no new text; waiting (cap {think_cap:.0f}s)")
                 deadline = extended
             else:
                 logger.warning(
@@ -1019,7 +1061,8 @@ async def run_chat(provider, prompt: str, attachments: Optional[list] = None, *,
                    allow_local_paths: bool = True,
                    ephemeral: bool = False,
                    meta: Optional[dict] = None,
-                   variant: Optional[str] = None) -> AsyncGenerator[str, None]:
+                   variant: Optional[str] = None,
+                   timeout: Optional[float] = None) -> AsyncGenerator[str, None]:
     """Open the provider's chat, attach any input images, send the prompt, stream
     text deltas, then append any generated images as markdown links.
 
@@ -1034,7 +1077,7 @@ async def run_chat(provider, prompt: str, attachments: Optional[list] = None, *,
             page, monitor = await provider.open_and_send(browser, prompt, attachments=files,
                                                          options=options)
 
-            async for delta in _stream_completion(provider, page, monitor):
+            async for delta in _stream_completion(provider, page, monitor, timeout=timeout):
                 yield delta
 
             used = await _read_model_used(provider, page, monitor, options)
@@ -1069,7 +1112,8 @@ async def drive_once(provider, prompt: str, attachments: Optional[list] = None, 
                      ephemeral: bool = False,
                      meta: Optional[dict] = None,
                      variant: Optional[str] = None,
-                     kind: str = "chat") -> tuple[str, list[dict]]:
+                     kind: str = "chat",
+                     timeout: Optional[float] = None) -> tuple[str, list[dict]]:
     """Non-streaming drive used by non-streaming chat and the images endpoints:
     returns (text, images). ``kind`` "image" makes the provider read the
     site's own image counter first (see Provider.prepare_page)."""
@@ -1083,7 +1127,13 @@ async def drive_once(provider, prompt: str, attachments: Optional[list] = None, 
             if meta is not None and "image_tool" in options:
                 meta["image_tool"] = options["image_tool"]
             text = ""
-            async for delta in _stream_completion(provider, page, monitor):
+            if timeout is None and kind == "image":
+                # An image request keeps the caps it had before the long
+                # thinking wait (a silent page gives up near 420 s, a streaming
+                # one by 900 s): a stuck image must not hold the browser 25 min,
+                # and its clients wait 440 s.
+                timeout = _BASE_DEADLINE
+            async for delta in _stream_completion(provider, page, monitor, timeout=timeout):
                 text += delta
             used = await _read_model_used(provider, page, monitor, options)
             if meta is not None and used:
@@ -1711,6 +1761,9 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     guest = _guest(request)
     # A guest's conversations never stay in the owner's account.
     ephemeral = True if guest else _ephemeral(req)
+    # A guest key (an outside party) never sets its own limit: one request
+    # could otherwise hold the one shared tab for an hour (second review).
+    timeout = None if guest else req.timeout
     if guest and QUOTA.snapshot(guest)["remaining"] <= 0:
         prompt = _WORDS_ONLY + prompt
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
@@ -1754,7 +1807,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     async for chunk in run_chat(provider, prompt, specs,
                                                 allow_local_paths=allow_paths,
                                                 ephemeral=ephemeral,
-                                                meta=meta, variant=req.model_variant):
+                                                meta=meta, variant=req.model_variant,
+                                                timeout=timeout):
                         yield _chunk(chunk, None)
             except Exception as e:
                 # Surface the failure in-band; a raised exception here would
@@ -1780,7 +1834,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             text, imgs = await drive_once(provider, prompt, specs,
                                           allow_local_paths=allow_paths,
                                           ephemeral=ephemeral,
-                                          meta=meta, variant=req.model_variant)
+                                          meta=meta, variant=req.model_variant,
+                                          timeout=timeout)
         except HTTPException:
             _record_request(provider.name, started, RuntimeError("bad request"))
             raise

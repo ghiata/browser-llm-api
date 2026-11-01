@@ -34,6 +34,7 @@ Extra fields this server understands:
 | Field | Meaning |
 |---|---|
 | `model_variant` | ChatGPT model and power for this request (see above) |
+| `timeout` | seconds this request may run once it has the browser (queue time not counted) while the page still shows the model thinking with no new text; default `BROWSER_LLM_THINKING_DEADLINE`, clamped to 30 to `BROWSER_LLM_MAX_REQUEST_TIMEOUT`. An answer still streaming text may run to 900 s even when this is shorter, and a page that stopped working still gives up near 420 s (or this, when shorter). Ignored for a guest key |
 | `ephemeral` | `true` deletes the conversation from the account once the answer is read |
 | `images` | a shorthand list of image specs, attached alongside any in the messages |
 

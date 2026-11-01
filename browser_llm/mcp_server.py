@@ -50,6 +50,9 @@ SERVER_NAME = "browser-llm"
 BASE = os.environ.get("BROWSER_LLM_API", "http://localhost:8081").rstrip("/")
 API_KEY = os.environ.get("BROWSER_LLM_API_KEY", "").strip()
 DEFAULT_TIMEOUT = int(os.environ.get("BROWSER_LLM_MCP_TIMEOUT", "440"))
+# `ask` waits longer: GPT-6 High can think silently for over seven minutes, and
+# the server keeps waiting while the page shows it working (EBE-7813).
+ASK_TIMEOUT = int(os.environ.get("BROWSER_LLM_MCP_ASK_TIMEOUT", "1500"))
 
 
 _write_lock = threading.Lock()
@@ -82,7 +85,8 @@ TOOLS = [
             "and get its reply as text. Attach images to have it look at screenshots, "
             "mockups or photos. Every call should demand a finished artifact (a complete "
             "HTML page, a hard critique with the replacement markup) rather than an "
-            "opinion. Text replies take 15-60s at High; model_variant 'instant' is faster."
+            "opinion. Text replies take 15-60s at High, a long brief can think for over "
+            "seven minutes (waited for up to `timeout`); model_variant 'instant' is faster."
         ),
         "inputSchema": {
             "type": "object",
@@ -117,7 +121,9 @@ TOOLS = [
                                    "path is returned instead of the full text, which "
                                    "keeps a large HTML page out of the conversation.",
                 },
-                "timeout": {"type": "integer", "description": "Seconds to wait (default 440)."},
+                "timeout": {"type": "integer",
+                            "description": f"Seconds to wait; also the server's limit for a "
+                                           f"page still thinking (default {ASK_TIMEOUT})."},
                 "keep_chat": {
                     "type": "boolean",
                     "description": "Leave the conversation in the account's history. "
@@ -336,7 +342,7 @@ def tool_ask(args):
         prompt,
         model=args.get("model"),
         system=args.get("system"),
-        timeout=int(args.get("timeout") or DEFAULT_TIMEOUT),
+        timeout=int(args.get("timeout") or ASK_TIMEOUT),
         images=args.get("images") or None,
         # An agent's question is tooling, not conversation: it has no business
         # sitting in the account's chat history afterwards.

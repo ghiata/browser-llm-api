@@ -54,7 +54,25 @@ def _image_spec(path_or_url):
         return f"data:{mime};base64," + base64.b64encode(f.read()).decode()
 
 
-def ask(prompt, model=None, system=None, timeout=440, stream=False, on_delta=None,
+# A text answer at GPT-6 High can think silently for over seven minutes; the
+# server waits while the page still shows it working (EBE-7813), so the client
+# waits as long and tells the server the same limit.
+ASK_TIMEOUT = 1500
+# The server's limit starts once it has the browser and leaves out opening the
+# page and reading the answer afterwards, so this side waits this much longer;
+# otherwise a long answer is lost when the client gives up first.
+QUEUE_MARGIN = 300
+# An answer whose text is still arriving may run this long on the server
+# whatever the request's timeout (server._MAX_DEADLINE): never wait less.
+STREAM_CAP = 900
+
+
+def _wait(timeout):
+    """How long this side waits for a request sent with ``timeout``."""
+    return None if timeout is None else max(timeout, STREAM_CAP) + QUEUE_MARGIN
+
+
+def ask(prompt, model=None, system=None, timeout=ASK_TIMEOUT, stream=False, on_delta=None,
         images=None, ephemeral=False, model_variant=None, fallback=True):
     """Send a chat completion and return the assistant text.
     If stream=True, on_delta(str) is called for each chunk as it arrives.
@@ -64,6 +82,10 @@ def ask(prompt, model=None, system=None, timeout=440, stream=False, on_delta=Non
     back, for prompts that are tooling rather than conversation.
     ``model_variant`` picks ChatGPT's model and power for this request
     ("instant", "GPT-6/medium"); unset uses the server's setting (GPT-6, High).
+    ``timeout`` is sent as the request's own limit for a page that is still
+    thinking (the server's ``timeout`` field); this side waits at least
+    ``STREAM_CAP`` and ``QUEUE_MARGIN`` seconds more, for opening the page and
+    reading the answer (not for a long queue). ``None`` waits with no limit.
     ``fallback`` (default True) lets a failed or empty answer be retried once on
     ``BROWSER_LLM_FALLBACK_API`` with ``BROWSER_LLM_FALLBACK_MODEL``, when that
     is configured. A request the server rejected as malformed (HTTP 400) is not
@@ -79,6 +101,8 @@ def ask(prompt, model=None, system=None, timeout=440, stream=False, on_delta=Non
     else:
         messages.append({"role": "user", "content": prompt})
     payload = {"model": model or DEFAULT_MODEL, "messages": messages, "stream": stream}
+    if timeout:
+        payload["timeout"] = timeout
     if ephemeral:
         payload["ephemeral"] = True
     if model_variant:
@@ -91,7 +115,7 @@ def ask(prompt, model=None, system=None, timeout=440, stream=False, on_delta=Non
             on_delta(d)
 
     try:
-        text = _ask_once(BASE, API_KEY, payload, timeout, stream, _on_delta)
+        text = _ask_once(BASE, API_KEY, payload, _wait(timeout), stream, _on_delta)
         reason = "" if text.strip() else "empty answer"
     except urllib.error.HTTPError as e:
         if e.code == 400:
@@ -108,9 +132,10 @@ def ask(prompt, model=None, system=None, timeout=440, stream=False, on_delta=Non
 
     fb = dict(payload, model=FALLBACK_MODEL)
     fb.pop("model_variant", None)   # a ChatGPT setting; the fallback is usually not ChatGPT
+    fb.pop("timeout", None)         # this server's field; an OpenAI-style API rejects it
     print(f"[client] {payload['model']} at {BASE} failed ({reason}); "
           f"falling back to {FALLBACK_MODEL} at {FALLBACK_BASE}", file=sys.stderr, flush=True)
-    return _ask_once(FALLBACK_BASE, FALLBACK_API_KEY, fb, timeout, stream, _on_delta)
+    return _ask_once(FALLBACK_BASE, FALLBACK_API_KEY, fb, _wait(timeout), stream, _on_delta)
 
 
 def _ask_once(base, api_key, payload, timeout, stream, on_delta):
@@ -160,7 +185,9 @@ def main():
     ap.add_argument("--stream", action="store_true", help="stream tokens as they arrive")
     ap.add_argument("--strip-fences", action="store_true",
                     help="drop ``` code-fence lines (handy with --out for code/HTML)")
-    ap.add_argument("--timeout", type=int, default=440)
+    ap.add_argument("--timeout", type=int, default=ASK_TIMEOUT,
+                    help=f"the server's limit for a page still thinking; this side waits at least "
+                         f"{STREAM_CAP} s and {QUEUE_MARGIN} s more (default {ASK_TIMEOUT})")
     a = ap.parse_args()
 
     live = a.stream and not a.out
