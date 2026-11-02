@@ -1745,6 +1745,33 @@ def _client_may_send_paths(request: Request) -> bool:
                                    request.headers.get("host"))
 
 
+_GONE_PROBE_S = 0.1
+
+
+async def _caller_gone(request: Optional[Request]) -> bool:
+    """True when the caller has hung up. Asked once a queued request gets the
+    provider's lock: a caller who gave up while waiting would otherwise hold the
+    browser for an answer nobody reads, up to the drive's cap, while everything
+    queued behind it waits.
+
+    ``request.is_disconnected()`` cannot answer this here. Behind the
+    ``@app.middleware("http")`` key check (Starlette's BaseHTTPMiddleware) its
+    receive runs inside a task group, and the already-cancelled scope it uses
+    cancels on that group's exit, dropping the disconnect message, so every
+    caller reads as connected. A short real wait on ``receive()`` lets the
+    group finish: the server hands a caller who hung up ``http.disconnect`` at
+    once, and a timeout means the caller is still there. The body has already
+    been read into the route's model, so nothing else is waiting to arrive. Any
+    other answer, or an error, counts as still there."""
+    if request is None:
+        return False
+    try:
+        msg = await asyncio.wait_for(request.receive(), _GONE_PROBE_S)
+    except (asyncio.TimeoutError, Exception):
+        return False
+    return msg.get("type") == "http.disconnect"
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest, request: Request):
     if not req.messages:
@@ -1829,6 +1856,11 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     # --- Non-streaming ---
     meta: dict = {}
     async with _locks[provider.name]:
+        if await _caller_gone(request):
+            # The caller left while queued: free the browser for the next one.
+            logger.warning(f"[{provider.name}] caller left while queued; "
+                           f"dropped before the drive")
+            raise HTTPException(status_code=499, detail="client closed the request while queued")
         started = time.monotonic()
         try:
             text, imgs = await drive_once(provider, prompt, specs,
