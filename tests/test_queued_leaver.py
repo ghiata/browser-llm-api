@@ -32,10 +32,13 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-def _request(port: int, prompt: str) -> bytes:
-    body = json.dumps({"model": PROVIDER,
-                       "messages": [{"role": "user", "content": prompt}]}).encode()
-    head = (f"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+def _request(port: int, prompt: str, path: str = "/v1/chat/completions") -> bytes:
+    if path == "/v1/chat/completions":
+        payload = {"model": PROVIDER, "messages": [{"role": "user", "content": prompt}]}
+    else:
+        payload = {"model": PROVIDER, "prompt": prompt}
+    body = json.dumps(payload).encode()
+    head = (f"POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
             f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n"
             f"Connection: close\r\n\r\n").encode()
     return head + body
@@ -86,9 +89,9 @@ class QueuedLeaverTest(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.02)
         self.fail(f"{n} request(s) never queued on the provider lock")
 
-    async def _send(self, prompt: str):
+    async def _send(self, prompt: str, path: str = "/v1/chat/completions"):
         reader, writer = await asyncio.open_connection("127.0.0.1", self.port)
-        writer.write(_request(self.port, prompt))
+        writer.write(_request(self.port, prompt, path))
         await writer.drain()
         return reader, writer
 
@@ -112,6 +115,24 @@ class QueuedLeaverTest(unittest.IsolatedAsyncioTestCase):
         # FIFO lock: the leaver was first in line, so its turn came and went
         # before the live caller's drive.
         self.assertEqual(self.driven, ["live"])
+
+    async def test_image_leaver_is_dropped_and_live_caller_is_driven(self):
+        await self.lock.acquire()
+        _, leaver = await self._send("leaver fox", "/v1/images/generations")
+        await self._queued(1)
+        leaver.close()
+        await leaver.wait_closed()
+        live_r, live_w = await self._send("live fox", "/v1/images/generations")
+        await self._queued(2)
+        await asyncio.sleep(0.3)
+        self.lock.release()
+        # The fake drive makes no image, so the live caller gets the route's
+        # own no-image answer; what matters is which requests were driven.
+        await asyncio.wait_for(live_r.read(), 15)
+        live_w.close()
+        self.assertEqual(len(self.driven), 1, self.driven)
+        self.assertIn("live fox", self.driven[0])
+        self.assertNotIn("leaver", self.driven[0])
 
     async def test_live_caller_queued_alone_is_served(self):
         await self.lock.acquire()

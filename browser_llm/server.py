@@ -2005,7 +2005,8 @@ async def _run_image_request(provider, prompt: str, specs: list, raw: Optional[l
                              background: Optional[str] = None,
                              variant: Optional[str] = None,
                              record: Optional[dict] = None,
-                             guest: Optional[guests.Guest] = None):
+                             guest: Optional[guests.Guest] = None,
+                             request: Optional[Request] = None):
     """Shared body of /v1/images/generations and /v1/images/edits. ``record``
     is kept beside each saved image (see _write_record). A ``guest`` request
     takes a place in that guest's allowance before it queues (429 when none is
@@ -2035,6 +2036,13 @@ async def _run_image_request(provider, prompt: str, specs: list, raw: Optional[l
     meta: dict = {}
     try:
         async with _locks[provider.name]:
+            if await _caller_gone(request):
+                # Left while queued: no drive, and the finally below gives a
+                # guest's reserved image back.
+                logger.warning(f"[{provider.name}] {what}: caller left while queued; "
+                               f"dropped before the drive")
+                raise HTTPException(status_code=499,
+                                    detail="client closed the request while queued")
             started = time.monotonic()
             try:
                 text, imgs = await drive_once(provider, typed, specs, raw_uploads=raw,
@@ -2098,7 +2106,7 @@ async def images_generations(req: ImageGenRequest, request: Request):
                                     background=background, variant=req.model_variant,
                                     record={"brief": req.prompt, "kind": dfields.get("kind"),
                                             "references": len(specs)},
-                                    guest=_guest(request))
+                                    guest=_guest(request), request=request)
 
 
 @app.post("/v1/images/edits")
@@ -2167,7 +2175,7 @@ async def images_edits(request: Request):
                                     size=size, background=background, variant=variant,
                                     record={"brief": brief, "kind": dfields.get("kind"),
                                             "references": len(specs) + len(raw)},
-                                    guest=_guest(request))
+                                    guest=_guest(request), request=request)
 
 
 # ---------------------------------------------------------------------------
