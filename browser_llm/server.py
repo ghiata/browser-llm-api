@@ -1748,9 +1748,17 @@ def _client_may_send_paths(request: Request) -> bool:
 _GONE_PROBE_S = 0.1
 
 
+def _must_queue(name: str) -> bool:
+    """Whether a request arriving now waits for the provider's lock: it is held,
+    or freed with a waiter not yet woken (which goes first). Only a request that
+    waited is probed by _caller_gone, so one that never queued pays no delay."""
+    lock = _locks[name]
+    return lock.locked() or bool(getattr(lock, "_waiters", None))
+
+
 async def _caller_gone(request: Optional[Request]) -> bool:
-    """True when the caller has hung up. Asked once a queued request gets the
-    provider's lock: a caller who gave up while waiting would otherwise hold the
+    """True when the caller has hung up. Asked once a request that had to
+    queue gets the provider's lock: a caller who gave up while waiting would otherwise hold the
     browser for an answer nobody reads, up to the drive's cap, while everything
     queued behind it waits.
 
@@ -1855,8 +1863,9 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
 
     # --- Non-streaming ---
     meta: dict = {}
+    queued = _must_queue(provider.name)
     async with _locks[provider.name]:
-        if await _caller_gone(request):
+        if queued and await _caller_gone(request):
             # The caller left while queued: free the browser for the next one.
             logger.warning(f"[{provider.name}] caller left while queued; "
                            f"dropped before the drive")
@@ -2035,8 +2044,9 @@ async def _run_image_request(provider, prompt: str, specs: list, raw: Optional[l
             raise _quota_http(e)
     meta: dict = {}
     try:
+        queued = _must_queue(provider.name)
         async with _locks[provider.name]:
-            if await _caller_gone(request):
+            if queued and await _caller_gone(request):
                 # Left while queued: no drive, and the finally below gives a
                 # guest's reserved image back.
                 logger.warning(f"[{provider.name}] {what}: caller left while queued; "

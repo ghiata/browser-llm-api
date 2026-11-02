@@ -32,7 +32,8 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-def _request(port: int, prompt: str, path: str = "/v1/chat/completions") -> bytes:
+def _request(port: int, prompt: str, path: str = "/v1/chat/completions",
+             keep_alive: bool = False) -> bytes:
     if path == "/v1/chat/completions":
         payload = {"model": PROVIDER, "messages": [{"role": "user", "content": prompt}]}
     else:
@@ -40,7 +41,7 @@ def _request(port: int, prompt: str, path: str = "/v1/chat/completions") -> byte
     body = json.dumps(payload).encode()
     head = (f"POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
             f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n"
-            f"Connection: close\r\n\r\n").encode()
+            + ("" if keep_alive else "Connection: close\r\n") + "\r\n").encode()
     return head + body
 
 
@@ -54,7 +55,8 @@ class QueuedLeaverTest(unittest.IsolatedAsyncioTestCase):
 
         self.patches = [mock.patch.object(server, "drive_once", fake_drive),
                         mock.patch.object(server, "API_KEY", ""),
-                        mock.patch.object(server, "GUESTS", {})]
+                        mock.patch.object(server, "GUESTS", {}),
+                        mock.patch.object(server, "IMAGE_PROVIDERS", [PROVIDER])]
         for p in self.patches:
             p.start()
         # A fresh lock bound to this test's event loop.
@@ -89,15 +91,25 @@ class QueuedLeaverTest(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.02)
         self.fail(f"{n} request(s) never queued on the provider lock")
 
-    async def _send(self, prompt: str, path: str = "/v1/chat/completions"):
+    async def _send(self, prompt: str, path: str = "/v1/chat/completions",
+                    keep_alive: bool = False):
         reader, writer = await asyncio.open_connection("127.0.0.1", self.port)
-        writer.write(_request(self.port, prompt, path))
+        writer.write(_request(self.port, prompt, path, keep_alive))
         await writer.drain()
         return reader, writer
 
     async def test_leaver_is_dropped_and_live_caller_is_served(self):
+        await self._leaver_then_live(keep_alive=False)
+
+    async def test_keep_alive_leaver_is_dropped(self):
+        # The usual client (httpx, requests) keeps the connection open, so the
+        # server pauses reading after the body and only sees the hang-up when
+        # the probe's receive() resumes reading.
+        await self._leaver_then_live(keep_alive=True)
+
+    async def _leaver_then_live(self, keep_alive: bool):
         await self.lock.acquire()          # another request holds the browser
-        _, leaver = await self._send("leaver")
+        _, leaver = await self._send("leaver", keep_alive=keep_alive)
         await self._queued(1)
         leaver.close()                     # the caller gives up while queued
         await leaver.wait_closed()
@@ -118,7 +130,7 @@ class QueuedLeaverTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_image_leaver_is_dropped_and_live_caller_is_driven(self):
         await self.lock.acquire()
-        _, leaver = await self._send("leaver fox", "/v1/images/generations")
+        _, leaver = await self._send("leaver fox", "/v1/images/generations", keep_alive=True)
         await self._queued(1)
         leaver.close()
         await leaver.wait_closed()
@@ -145,12 +157,21 @@ class QueuedLeaverTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b" 200 ", raw.split(b"\r\n", 1)[0], raw[:300])
         self.assertEqual(self.driven, ["waiting"])
 
-    async def test_unqueued_caller_is_served(self):
-        r, w = await self._send("straight")
-        raw = await asyncio.wait_for(r.read(), 15)
+    async def test_unqueued_caller_is_served_without_a_probe(self):
+        probes = []
+        real = server._caller_gone
+
+        async def counted(request):
+            probes.append(1)
+            return await real(request)
+
+        with mock.patch.object(server, "_caller_gone", counted):
+            r, w = await self._send("straight")
+            raw = await asyncio.wait_for(r.read(), 15)
         w.close()
         self.assertIn(b" 200 ", raw.split(b"\r\n", 1)[0], raw[:300])
         self.assertEqual(self.driven, ["straight"])
+        self.assertEqual(probes, [], "a request that never queued pays no probe")
 
 
 if __name__ == "__main__":
