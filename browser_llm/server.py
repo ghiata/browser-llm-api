@@ -1753,7 +1753,8 @@ def _must_queue(name: str) -> bool:
     or freed with a waiter not yet woken (which goes first). Only a request that
     waited is probed by _caller_gone, so one that never queued pays no delay."""
     lock = _locks[name]
-    return lock.locked() or bool(getattr(lock, "_waiters", None))
+    waiters = getattr(lock, "_waiters", None) or ()
+    return lock.locked() or any(not w.cancelled() for w in waiters)
 
 
 async def _caller_gone(request: Optional[Request]) -> bool:
@@ -1773,11 +1774,19 @@ async def _caller_gone(request: Optional[Request]) -> bool:
     other answer, or an error, counts as still there."""
     if request is None:
         return False
-    try:
-        msg = await asyncio.wait_for(request.receive(), _GONE_PROBE_S)
-    except (asyncio.TimeoutError, Exception):
-        return False
-    return msg.get("type") == "http.disconnect"
+    # Twice: a loop busy past the timeout can fire the timer in the same pass
+    # that reads the hang-up, before the server has marked it; one yield
+    # later the server's receive() answers http.disconnect at once.
+    for wait in (_GONE_PROBE_S, 0.01):
+        try:
+            msg = await asyncio.wait_for(request.receive(), wait)
+        except asyncio.TimeoutError:
+            await asyncio.sleep(0)
+            continue
+        except Exception:
+            return False
+        return msg.get("type") == "http.disconnect"
+    return False
 
 
 @app.post("/v1/chat/completions")
