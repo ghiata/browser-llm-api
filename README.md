@@ -33,7 +33,7 @@ client.chat.completions.create(
 
 ### Scope
 
-In scope: one person's or one team's signed-in ChatGPT and Gemini sessions on a Linux machine, one request at a time per provider, used from scripts, agents, the dashboard and the widget. Out of scope: pooling several accounts, parallel requests to one provider, headless Chrome (both sites block it, so a background run uses an Xvfb display), and Windows or macOS, which are untested. Version 2.0 removed forwarding a model from one install to another; a second machine calls this API directly with a key.
+In scope: one person's or one team's signed-in ChatGPT and Gemini sessions on a Linux machine, one request at a time per browser (ChatGPT can run up to eight browsers of the one account, `BROWSER_LLM_LANES`), used from scripts, agents, the dashboard and the widget. Out of scope: pooling several accounts, headless Chrome (both sites block it, so a background run uses an Xvfb display), and Windows or macOS, which are untested. Version 2.0 removed forwarding a model from one install to another; a second machine calls this API directly with a key.
 
 ## Install and first run
 

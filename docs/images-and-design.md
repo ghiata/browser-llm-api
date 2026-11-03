@@ -17,7 +17,7 @@ The size and background are written into the prompt in plain words, because the 
 
 So the asset tool crops to the exact pixels afterwards. Asked for a transparent background, ChatGPT returned a real PNG with an alpha channel.
 
-An image takes about a minute; 48 to 96 seconds were measured. Requests to one provider run one at a time, so a batch queues. The image is written to disk before the response returns, so after a client timeout, look for the newest file in the image folder before retrying. The provider's browser restarts after `BROWSER_RECYCLE_AFTER_IMAGES` images (default 8) to keep its memory in check.
+An image takes about a minute; 48 to 96 seconds were measured. Images run one at a time (`BROWSER_LLM_IMAGE_CONCURRENCY`, default 1), so a batch queues, but a chat answer no longer holds an image back when the install has more than one lane. The image is written to disk before the response returns, so after a client timeout, look for the newest file in the image folder before retrying. The provider's browser restarts after `BROWSER_RECYCLE_AFTER_IMAGES` images (default 8) to keep its memory in check.
 
 ChatGPT's image tool needs an X display, because the picture renders on a canvas. Chrome's headless mode does not work, but a plain Xvfb display does, and that is what the background service uses.
 

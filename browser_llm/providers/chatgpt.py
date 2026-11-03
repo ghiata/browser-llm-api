@@ -395,6 +395,9 @@ class ChatGPTProvider(Provider):
     name = "chatgpt-browser"
     chat_url = "https://chatgpt.com/"
     profile_dir = "./chatgpt_profile"
+    # Measured 3 Nov 2026: a copy of the cookie store in a fresh profile opens
+    # chatgpt.com signed in (composer present, no log-in button).
+    supports_lanes = True
     stream_url_fragments = ["backend-api/conversation", "/f/conversation"]
     # ChatGPT streams tokens over a WebSocket (ws.chatgpt.com), so the HTTP
     # stream-done signal never fires. We can't read completion out of the

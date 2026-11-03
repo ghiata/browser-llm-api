@@ -36,7 +36,7 @@ An installed package works too: `browser-llm mcp` or `browser-llm-mcp`. Point it
 
 ## How it behaves
 
-Tool calls run on worker threads, so a long image generation never blocks a ping or a second call. Requests still queue per provider on the server, which is where the browser lock is. The server's stdout carries protocol frames only, and every log line goes to stderr.
+Tool calls run on worker threads, so a long image generation never blocks a ping or a second call. Requests still queue on the server, which is where the browsers are: one request per browser, and `BROWSER_LLM_LANES` sets how many browsers ChatGPT has. The server's stdout carries protocol frames only, and every log line goes to stderr.
 
 An image takes about a minute, and a design set takes about a minute per image. Many clients time out a tool call after a few minutes. A set of more than six images is better run from the command line in the background (`browser-llm design set ...`). If a call does time out, the set keeps running and resumes when called again with the same arguments.
 

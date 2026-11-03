@@ -32,7 +32,10 @@ cp .env.example .env      # then edit
 | `BROWSER_LLM_THINKING_DEADLINE` | `1500` | seconds a request may wait while the page still shows the model working with no new text (a long thinking phase); never below the 900 s streaming cap |
 | `BROWSER_LLM_MAX_REQUEST_TIMEOUT` | `3600` | the most a chat request's own `timeout` may ask for; never below `BROWSER_LLM_THINKING_DEADLINE` |
 | `BROWSER_LLM_PREWARM` | `1` | start the default provider's browser at startup; `0` starts none until a request needs one |
-| `BROWSER_RECYCLE_AFTER_IMAGES` | `8` | restart a provider's browser after this many images |
+| `BROWSER_RECYCLE_AFTER_IMAGES` | `8` | restart a browser after this many images (each lane counts its own) |
+| `BROWSER_LLM_LANES` | `1` | browsers per provider, 1 to 8; see [Lanes](#lanes). ChatGPT only: other providers stay at 1 |
+| `BROWSER_LLM_LANE_IDLE_SECONDS` | `600` | an extra lane's browser closes after this long without a request |
+| `BROWSER_LLM_IMAGE_CONCURRENCY` | `1` | image requests allowed to run at once, across lanes; chat is not limited by it |
 | `MAX_ATTACHMENTS` | `6` | most images one request may attach |
 | `MAX_ATTACHMENT_MB` | `20` | size limit per attachment |
 | `ALLOW_REMOTE_FILE_PATHS` | unset | let callers on other machines or other origins attach files by server path |
@@ -58,6 +61,17 @@ The client prints one line on stderr when it falls back, and the MCP `health` to
 servers.
 
 Settings for the watchdog: `BLM_ALERT_DIR` writes each alert as a Markdown file into a folder, and `BLM_ALERT_CMD` runs a command per alert with `BLM_ALERT_SEVERITY`, `BLM_ALERT_TITLE`, `BLM_ALERT_BODY` and `BLM_ALERT_KIND` set. See [Running it](running.md#watchdog).
+
+### Lanes
+
+By default a provider has one Chrome and runs one request at a time; the rest wait. `BROWSER_LLM_LANES=3` gives ChatGPT up to three browsers, so up to three requests run together.
+
+- Lane 1 is the browser you already have (`chatgpt_profile/`). Lanes 2 and 3 start only when every running lane is busy, so a quiet server still has one browser. They close after `BROWSER_LLM_LANE_IDLE_SECONDS` without a request.
+- Each extra lane is a separate Chrome with its own profile (`chatgpt_lane2_profile/`) and its own private X display. At start it copies the cookies of lane 1, so it is signed in to the same account without another sign-in. Nothing is copied back, and lane 1's profile is only read.
+- A lane that cannot start, or that the site shows signed out, is left alone for five minutes and the request takes another lane.
+- All lanes use one account, so they share its limits. Concurrent chats count against the same Plus allowance, and ChatGPT may answer 429 if it sees too many at once. `BROWSER_LLM_IMAGE_CONCURRENCY=1` keeps images one at a time, which is the pace the site's image limit was measured at; raise it only after trying it.
+- Each lane needs about 2 GB of memory while it runs. Reading or deleting the account's history uses a lane that is already running and never starts one.
+- `/api/status` shows `lanes_total`, `lanes_busy`, `queued` and one row per lane. `busy` is true while any lane works, so "restart only when nothing is busy" is unchanged.
 
 ### Names that changed in 2.0
 

@@ -33,7 +33,8 @@ This is inherently **fragile**: each provider depends on its site's live DOM/sel
 also sits behind Cloudflare/anti-bot. A UI change can silently break extraction or submission.
 
 **Scope (2.x).** One person's or team's signed-in sessions on Linux, one request at a time per
-provider. Forwarding a model to another install (`REMOTE_PROVIDERS`) was removed in 2.0; another
+browser (`BROWSER_LLM_LANES` gives ChatGPT up to eight browsers of the one account; see Lanes).
+Forwarding a model to another install (`REMOTE_PROVIDERS`) was removed in 2.0; another
 machine calls the API directly with a key. Don't bring it back without a decision.
 
 ## Dashboard and widget
@@ -110,8 +111,10 @@ browser_llm/                 # THE PACKAGE. Imports inside it are relative (from
   guests.py                  #   stdlib-only guest keys: parse_guest_keys (name:key:images),
                              #   ImageQuota (rolling 24 h per guest, reserve/commit/release, JSON
                              #   in BROWSER_LLM_STATE_DIR).
+  lanes.py                   #   stdlib-only: LanePool (which lane a request takes), clone_login (copy
+                             #   lane 0's cookies), PrivateDisplay (an Xvfb per extra lane).
   providers/
-    __init__.py              #   PROVIDERS registry, get_provider, DEFAULT_PROVIDER, IMAGE_PROVIDERS
+    __init__.py              #   PROVIDERS registry, LANES, get_provider, DEFAULT_PROVIDER, IMAGE_PROVIDERS
     limits.py                #   UsageLimitReached, quota_refusal, refusal_from_message → HTTP 429
     base.py                  #   Provider ABC, StreamMonitor, CompletionTracker, open_and_send,
                              #   upload machinery, patch_cdp, RateLimited, session_tab, CHROME_ARGS.
@@ -279,6 +282,43 @@ Everything downstream (`_stream_completion`, `run_chat`, `drive_once`, image per
 - **Sizes (Plus):** the tool picks a shape near the asked ratio: 1254x1254, 1672x941 (16:9),
   1731x909 (1.91:1), 1122x1402 (4:5). "Transparent background" gives a real RGBA PNG. Exact pixels
   come from gen_asset's crop.
+
+## Lanes (several browsers per provider)
+
+`BROWSER_LLM_LANES=N` (default 1, at most 8) gives a provider with `supports_lanes` (ChatGPT only)
+N browsers. `browser_llm/lanes.py` is stdlib only: `LanePool` picks the lane, `clone_login` and
+`PrivateDisplay` prepare an extra one. server.py's `_lane(provider)` is the one way a request takes a
+lane, and it yields that lane's `Provider` (`LANES[name][i]`, made by `Provider.for_lane`): every
+handler passes the yielded lane to `get_browser`, `run_chat` and `drive_once`, never the original.
+
+- **Lane 0 is the provider's own browser and profile**, on the service's display. Counters and
+  `_browsers` are keyed by `Provider.key` (the name for lane 0, `name#N` for others), so a one-lane
+  install reads exactly as before. `PROVIDERS[name]` stays lane 0.
+- **Extra lanes start only when every running lane is busy**, and close after
+  `BROWSER_LLM_LANE_IDLE_SECONDS` (`_reap_idle_lanes`, every 30 s). `cold_ok=False` (history read and
+  delete) never starts one; it waits for a running lane.
+- **An extra lane = its own profile dir + its own Xvfb.** `clone_login` copies lane 0's `Cookies`
+  through SQLite's backup call (read-only on the source, consistent while Chrome has it open) and
+  replaces the lane's copy each time it starts; `Local State` is copied once. This works because
+  `--password-store=basic` encrypts cookies with a fixed key. Measured 3 Nov 2026: a copy stays signed
+  in, three concurrent chats answered correctly, a chat and an image ran together, and a killed lane
+  Chrome healed on the next request. `PrivateDisplay` gives each lane an Xvfb with an access cookie;
+  a window on a shared display covers another and reads as hidden (see the hidden-page gotcha).
+  `_launch_browser` sets DISPLAY and XAUTHORITY in `os.environ` only while nodriver starts Chrome,
+  under `_lane_start_lock`, because nodriver offers no per-browser environment.
+- **A new lane is checked before it gets a request** (`_verify_lane_login`: `logged_in` for up to 40
+  s). A lane that fails to start or reads signed out is stopped and left alone 300 s, and the request
+  takes another lane or waits.
+- **Images take `_image_gates[name]` first** (`BROWSER_LLM_IMAGE_CONCURRENCY`, default 1): the site's
+  own image limits were measured at one image at a time. A gate waiter is not in the pool, so
+  `_must_queue` is OR-ed with `gate.locked()` for images.
+- **Lanes share one account**, so they share its Plus limits, and the usage counter shown in
+  `/api/status` is the most recent read from any lane. Profile folders are `<name>_lane<N>_profile`
+  and gitignored by `*_profile/`; never commit one (it holds cookies).
+- `busy` in `/api/status` means any lane is working, so the restart rule is unchanged. `lanes`,
+  `lanes_busy`, `queued` give the detail.
+- Tests: tests/test_lanes.py (pool rules, clone, display, server lane handling with a fake browser);
+  tests/test_queued_leaver.py drives a one-lane pool.
 
 ## Design kinds, sets, tokens and review
 
@@ -467,11 +507,12 @@ forward to them).
   next drive read 0 chars to the deadline: ChatGPT multiplexes one WebSocket per profile. Opening
   and closing a tab is not a fix.
 - **A tab pool cannot run two ChatGPT conversations in one Chrome** (tried and reverted): only one
-  answer completes; the throttling flags change nothing. Real concurrency needs one browser per slot,
-  a separate profile each (cloning, a login per profile, a Chrome's RAM each). The lock stays.
-- **The per-provider lock is taken INSIDE the SSE generator** in `chat_completions`. FastAPI runs the
-  generator after the handler returns, so a lock around `return StreamingResponse(...)` releases
-  before the first poll. Streaming failures go in-band as a `[browser-llm error: …]` chunk.
+  answer completes; the throttling flags change nothing. Concurrency is one browser per slot, a
+  separate profile each: see Lanes above.
+- **The lane is taken INSIDE the SSE generator** in `chat_completions` (`async with _lane(provider)`).
+  FastAPI runs the generator after the handler returns, so a lane taken around
+  `return StreamingResponse(...)` is given back before the first poll. Streaming failures go in-band
+  as a `[browser-llm error: …]` chunk.
 - **Non-headless is mandatory:** the sites block headless Chrome. Background = Xvfb, never
   `--headless`.
 - **ChatGPT image generation works under Xvfb** with the SwiftShader GL flags in `CHROME_ARGS`

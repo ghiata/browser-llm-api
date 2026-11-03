@@ -6,6 +6,7 @@ All notable changes, newest first. Versions follow [semantic versioning](https:/
 
 ### Server
 
+- Lanes: `BROWSER_LLM_LANES=3` gives ChatGPT up to three browsers of the same account, so up to three requests run at once instead of queueing behind one. An extra browser starts only when every running one is busy, copies the signed-in session of the first (no second sign-in), runs on an X display of its own, and closes after `BROWSER_LLM_LANE_IDLE_SECONDS` idle (default 600). Images stay one at a time unless `BROWSER_LLM_IMAGE_CONCURRENCY` is raised, but a chat no longer holds one back. `/api/status` lists each lane. The default is one lane, so nothing changes until you set it. See [Configuration](docs/configuration.md#lanes).
 - Guest keys: `BROWSER_LLM_GUEST_KEYS=name:key:images` lets another person use the server with an image allowance per 24 hours. A guest reaches chat, images, the model list and a trimmed status, never the account's history, the gallery or the delete endpoints, and its conversations are deleted after each answer. Past the allowance the image endpoints answer 429 with `Retry-After`. The count survives a restart (`BROWSER_LLM_STATE_DIR`). See [Configuration](docs/configuration.md#giving-someone-else-a-key).
 - `browser-llm design` plans a set against a guest key's own allowance.
 

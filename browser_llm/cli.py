@@ -74,6 +74,11 @@ def health(base=None) -> int:
         bits = ["browser up" if p.get("browser_running") else "browser not started",
                 "busy" if p.get("busy") else "idle",
                 f"{p.get('requests', 0)} requests, {p.get('errors', 0)} errors"]
+        if (p.get("lanes_total") or 1) > 1:
+            lane = f"{p.get('lanes_busy', 0)} of {p['lanes_total']} lanes busy, {p.get('lanes_running', 0)} running"
+            if p.get("queued"):
+                lane += f", {p['queued']} waiting"
+            bits.insert(2, lane)
         if p.get("model_setting"):
             bits.append(f"model {p['model_setting']}")
         if quota.get("remaining") is not None:

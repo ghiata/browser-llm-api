@@ -21,9 +21,32 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import uvicorn  # noqa: E402
 
-from browser_llm import server  # noqa: E402
+from browser_llm import lanes, server  # noqa: E402
 
 PROVIDER = "chatgpt-browser"
+
+
+class OnlyLane:
+    """The provider's single lane, held and given back the way this test once
+    held the provider's lock."""
+
+    def __init__(self, pool):
+        self.pool = pool
+
+    async def acquire(self):
+        await self.pool.acquire()
+
+    def release(self):
+        self.pool.release(0)
+
+    def locked(self):
+        return self.pool.busy_count() > 0
+
+    def waiting(self):
+        # An image request waits for the provider's image gate before it queues
+        # for a lane, so the second of two images is counted there.
+        gate = server._image_gates[PROVIDER]
+        return self.pool.waiting() + len(getattr(gate, "_waiters", None) or ())
 
 
 def _free_port() -> int:
@@ -59,10 +82,14 @@ class QueuedLeaverTest(unittest.IsolatedAsyncioTestCase):
                         mock.patch.object(server, "IMAGE_PROVIDERS", [PROVIDER])]
         for p in self.patches:
             p.start()
-        # A fresh lock bound to this test's event loop.
-        self.lock_patch = mock.patch.dict(server._locks, {PROVIDER: asyncio.Lock()})
+        # A fresh one-lane pool, whatever BROWSER_LLM_LANES says on this machine.
+        pool = lanes.LanePool(1)
+        self.lock_patch = mock.patch.dict(server._pools, {PROVIDER: pool})
+        self.lanes_patch = mock.patch.dict(
+            server.LANES, {PROVIDER: server.LANES[PROVIDER][:1]})
         self.lock_patch.start()
-        self.lock = server._locks[PROVIDER]
+        self.lanes_patch.start()
+        self.lock = OnlyLane(pool)
         self.port = _free_port()
         config = uvicorn.Config(server.app, host="127.0.0.1", port=self.port,
                                 lifespan="off", log_level="warning")
@@ -79,17 +106,18 @@ class QueuedLeaverTest(unittest.IsolatedAsyncioTestCase):
             self.lock.release()
         self.uv.should_exit = True
         await asyncio.wait_for(self.uv_task, 10)
+        self.lanes_patch.stop()
         self.lock_patch.stop()
         for p in self.patches:
             p.stop()
 
     async def _queued(self, n: int):
-        """Wait until n requests wait on the provider lock."""
+        """Wait until n requests wait for the provider's lane."""
         for _ in range(250):
-            if len(getattr(self.lock, "_waiters", None) or ()) >= n:
+            if self.lock.waiting() >= n:
                 return
             await asyncio.sleep(0.02)
-        self.fail(f"{n} request(s) never queued on the provider lock")
+        self.fail(f"{n} request(s) never queued for the provider's lane")
 
     async def _send(self, prompt: str, path: str = "/v1/chat/completions",
                     keep_alive: bool = False):
@@ -124,7 +152,7 @@ class QueuedLeaverTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b" 200 ", status, raw[:300])
         answer = json.loads(raw.split(b"\r\n\r\n", 1)[1])
         self.assertEqual(answer["choices"][0]["message"]["content"], "answer to live")
-        # FIFO lock: the leaver was first in line, so its turn came and went
+        # FIFO queue: the leaver was first in line, so its turn came and went
         # before the live caller's drive.
         self.assertEqual(self.driven, ["live"])
 

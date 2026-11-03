@@ -70,11 +70,11 @@ except ImportError:  # without it, urllib does the download
     httpx = None
 
 from .providers import (
-    PROVIDERS, DEFAULT_PROVIDER, IMAGE_PROVIDERS, get_provider, patch_cdp, CHROME_ARGS,
+    PROVIDERS, LANES, DEFAULT_PROVIDER, IMAGE_PROVIDERS, get_provider, patch_cdp, CHROME_ARGS,
     CompletionTracker, RateLimited, UsageLimitReached,
 )
 from .providers.limits import refusal_from_message
-from . import authz, config, design, guests
+from . import authz, config, design, guests, lanes
 from ._version import __version__
 
 # ---------------------------------------------------------------------------
@@ -454,11 +454,30 @@ def _design_prompt(prompt: str, fields: dict, n_refs: int, size: Optional[str],
     return text, size or d["size"], background or d["background"]
 
 # ---------------------------------------------------------------------------
-# Browser state — one persistent instance per provider, one request at a time
-# per provider (so Gemini and ChatGPT can run concurrently).
+# Browser state — a provider has one or more lanes (browser_llm/lanes.py), each
+# its own Chrome running one request at a time. Lane 0 is the provider's own
+# browser; with BROWSER_LLM_LANES above 1 the others start on demand from a copy
+# of its login and close when idle. Gemini and ChatGPT always run concurrently.
+# _browsers and _img_gen_count are keyed by Provider.key: the provider's name
+# for lane 0, name#N for the others.
 # ---------------------------------------------------------------------------
 _browsers: dict[str, uc.Browser] = {}
-_locks: dict[str, asyncio.Lock] = {name: asyncio.Lock() for name in PROVIDERS}
+_pools: dict[str, lanes.LanePool] = {name: lanes.LanePool(len(LANES[name])) for name in PROVIDERS}
+_displays: dict[str, lanes.PrivateDisplay] = {}   # an extra lane's own Xvfb
+_lane_start_lock = asyncio.Lock()   # one extra Chrome starts at a time (it borrows DISPLAY)
+
+# An extra lane's browser closes after this many idle seconds, freeing about 2 GB.
+_LANE_IDLE_SECONDS = float(os.environ.get("BROWSER_LLM_LANE_IDLE_SECONDS", "600"))
+# A lane that failed to start or is signed out is left alone this long.
+_LANE_RETRY_SECONDS = 300.0
+
+# Image requests allowed at once per provider, across lanes. ChatGPT limits how
+# fast images are made ("You're generating images too quickly"), and how many it
+# allows at once has not been measured, so the default is one: images still wait
+# for each other, but no longer for chat answers.
+_IMAGE_CONCURRENCY = max(1, int(os.environ.get("BROWSER_LLM_IMAGE_CONCURRENCY", "1") or 1))
+_image_gates: dict[str, asyncio.Semaphore] = {
+    name: asyncio.Semaphore(_IMAGE_CONCURRENCY) for name in PROVIDERS}
 
 # Recycle a provider's browser once it has done this many image gens. On the
 # free plan the renderer bloated after 4-5 slow image generations and started
@@ -485,7 +504,7 @@ _img_gen_count: dict[str, int] = {name: 0 for name in PROVIDERS}
 
 
 def _note_image_gen(provider) -> None:
-    _img_gen_count[provider.name] = _img_gen_count.get(provider.name, 0) + 1
+    _img_gen_count[provider.key] = _img_gen_count.get(provider.key, 0) + 1
 
 
 # Lightweight per-provider telemetry for the dashboard's live status panel.
@@ -548,21 +567,76 @@ async def _browser_alive(b: uc.Browser) -> bool:
         return False
 
 
-async def get_browser(provider) -> uc.Browser:
-    b = _browsers.get(provider.name)
+def _lane_label(provider) -> str:
+    """How a lane reads in the log: the provider's name, plus the lane's number
+    (counted from 1) when the provider has more than one."""
+    return provider.name if len(LANES[provider.name]) == 1 else f"{provider.name} lane {provider.lane + 1}"
 
-    # Proactively recycle a browser that has generated enough images to bloat.
-    # Called at the start of each (per-provider serialized) request, so the
-    # browser is never recycled mid-response.
-    if b is not None and _img_gen_count.get(provider.name, 0) >= _RECYCLE_AFTER_IMAGES:
-        logger.info(f"[{provider.name}] recycling browser after "
-                    f"{_img_gen_count[provider.name]} image gens")
+
+def _stop_browser(provider, b: Optional[uc.Browser]) -> None:
+    """Stop a lane's Chrome and forget everything that belonged to it: its
+    cached handle, its image count, its warm flag in the pool and, for an extra
+    lane, the private display it ran on."""
+    if b is not None:
         try:
             b.stop()
         except Exception as e:
-            logger.warning(f"[{provider.name}] browser stop during recycle failed: {e}")
-        _browsers.pop(provider.name, None)
-        _img_gen_count[provider.name] = 0
+            logger.warning(f"[{_lane_label(provider)}] browser stop failed: {e}")
+    key = provider.key
+    _browsers.pop(key, None)
+    _verified_lanes.discard(key)
+    _img_gen_count[key] = 0  # the count tracked THAT browser's bloat, not the next one's
+    _pools[provider.name].set_warm(provider.lane, False)
+    display = _displays.pop(key, None)
+    if display is not None:
+        display.stop()
+
+
+async def _launch_browser(provider) -> uc.Browser:
+    """Start a lane's Chrome. Lane 0 uses the service's own display. An extra
+    lane first copies lane 0's login, then gets an Xvfb of its own, because a
+    window another lane's window covers reads as hidden to the site."""
+    if provider.lane == 0:
+        return await uc.start(user_data_dir=provider.profile_dir,
+                              browser_args=list(CHROME_ARGS))
+    async with _lane_start_lock:
+        main = PROVIDERS[provider.name]
+        n = await asyncio.to_thread(lanes.clone_login, main.profile_dir, provider.profile_dir)
+        logger.info(f"[{_lane_label(provider)}] login copied from lane 1 ({n} cookies)")
+        display = lanes.PrivateDisplay()
+        await asyncio.to_thread(display.start)
+        # nodriver starts Chrome with the server's own environment, so DISPLAY
+        # is swapped for the moment Chrome starts. One lane starts at a time.
+        saved = {k: os.environ.get(k) for k in display.env}
+        os.environ.update(display.env)
+        try:
+            b = await uc.start(user_data_dir=provider.profile_dir,
+                               browser_args=list(CHROME_ARGS))
+        except BaseException:
+            await asyncio.to_thread(display.stop)
+            raise
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        _displays[provider.key] = display
+        return b
+
+
+async def get_browser(provider) -> uc.Browser:
+    """The lane's Chrome, started if there is none. Called at the start of each
+    request, once its lane is taken, so a browser is never recycled or replaced
+    under a request that is using it."""
+    key = provider.key
+    b = _browsers.get(key)
+
+    # Proactively recycle a browser that has generated enough images to bloat.
+    if b is not None and _img_gen_count.get(key, 0) >= _RECYCLE_AFTER_IMAGES:
+        logger.info(f"[{_lane_label(provider)}] recycling browser after "
+                    f"{_img_gen_count[key]} image gens")
+        _stop_browser(provider, b)
         b = None
         await asyncio.sleep(2)  # let Chrome release the profile before restart
 
@@ -570,14 +644,9 @@ async def get_browser(provider) -> uc.Browser:
     # replace it now so THIS request succeeds, instead of failing it once
     # and only recovering on the next one.
     if b is not None and not await _browser_alive(b):
-        logger.warning(f"[{provider.name}] cached browser is dead (process or CDP "
+        logger.warning(f"[{_lane_label(provider)}] cached browser is dead (process or CDP "
                        f"connection); starting a fresh one")
-        try:
-            b.stop()
-        except Exception:
-            pass
-        _browsers.pop(provider.name, None)
-        _img_gen_count[provider.name] = 0
+        _stop_browser(provider, b)
         b = None
         await asyncio.sleep(2)  # let Chrome release the profile before restart
 
@@ -588,9 +657,10 @@ async def get_browser(provider) -> uc.Browser:
                 f.unlink()
         except Exception:
             pass
-        logger.info(f"[{provider.name}] Starting browser (profile {provider.profile_dir})...")
-        b = await uc.start(user_data_dir=provider.profile_dir, browser_args=list(CHROME_ARGS))
-        _browsers[provider.name] = b
+        logger.info(f"[{_lane_label(provider)}] Starting browser (profile {provider.profile_dir})...")
+        b = await _launch_browser(provider)
+        _browsers[key] = b
+        _pools[provider.name].set_warm(provider.lane, True)
     return b
 
 
@@ -615,15 +685,93 @@ async def _evict_dead_browser(provider, exc: BaseException) -> None:
     *next* request starts a fresh one instead of retrying against a corpse."""
     if not _is_dead_transport(exc):
         return
-    b = _browsers.pop(provider.name, None)
-    _img_gen_count[provider.name] = 0  # count tracked THAT browser's bloat, not the next one's
+    b = _browsers.get(provider.key)
     if b is not None:
-        logger.warning(f"[{provider.name}] browser connection died ({exc!r}); "
+        logger.warning(f"[{_lane_label(provider)}] browser connection died ({exc!r}); "
                        f"evicting so the next request starts fresh")
+    _stop_browser(provider, b)
+
+
+# ---------------------------------------------------------------------------
+# Taking a lane for one request
+# ---------------------------------------------------------------------------
+_verified_lanes: set[str] = set()   # extra lanes whose login the site accepted
+
+
+async def _verify_lane_login(provider, browser) -> None:
+    """An extra lane starts from a copy of lane 0's cookies. Make sure the site
+    took them before a request is given the lane: a signed-out lane would
+    otherwise fail that request with "nothing happened on the page"."""
+    deadline = time.monotonic() + 40
+    async with provider.session_tab(browser) as page:
+        while not await provider.logged_in(page):
+            if time.monotonic() > deadline:
+                raise lanes.LaneUnavailable("the site did not accept the copied login")
+            await asyncio.sleep(2)
+
+
+async def _ready_extra_lane(provider) -> None:
+    await get_browser(provider)
+    key = provider.key
+    if key not in _verified_lanes:
+        await _verify_lane_login(provider, _browsers[key])
+        _verified_lanes.add(key)
+
+
+@asynccontextmanager
+async def _lane(provider, *, cold_ok: bool = True):
+    """Take one of the provider's lanes for one request and yield that lane's
+    Provider, which the request must use in place of ``provider``.
+
+    Takes a free lane whose browser runs; else starts an extra lane (so a
+    request waits only when every lane is busy). An extra lane that cannot start
+    or is signed out is left alone for _LANE_RETRY_SECONDS and the request takes
+    another lane. ``cold_ok=False`` is for work not worth starting a Chrome for.
+    """
+    pool = _pools[provider.name]
+    while True:
+        i = await pool.acquire(cold_ok=cold_ok)
+        lp = LANES[provider.name][i]
+        if i == 0:
+            break
         try:
-            b.stop()
-        except Exception:
-            pass
+            await _ready_extra_lane(lp)
+            break
+        except asyncio.CancelledError:
+            _stop_browser(lp, _browsers.get(lp.key))
+            pool.release(i, served=False)
+            raise
+        except Exception as e:
+            logger.warning(f"[{_lane_label(lp)}] unavailable for {_LANE_RETRY_SECONDS:.0f}s: {e}")
+            _stop_browser(lp, _browsers.get(lp.key))
+            pool.release(i, down_for=_LANE_RETRY_SECONDS, served=False)
+    try:
+        yield lp
+    finally:
+        pool.release(i)
+
+
+async def _reap_idle_lanes() -> None:
+    """Stop the browser of every extra lane that has been idle too long."""
+    for name, pool in _pools.items():
+        for i in pool.idle_extras(_LANE_IDLE_SECONDS):
+            if not pool.claim(i):
+                continue
+            lp = LANES[name][i]
+            try:
+                logger.info(f"[{_lane_label(lp)}] idle for {_LANE_IDLE_SECONDS:.0f}s; closing its browser")
+                _stop_browser(lp, _browsers.get(lp.key))
+            finally:
+                pool.release(i, served=False)
+
+
+async def _reap_loop() -> None:
+    while True:
+        await asyncio.sleep(30)
+        try:
+            await _reap_idle_lanes()
+        except Exception as e:
+            logger.warning(f"idle-lane check failed: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -1194,13 +1342,18 @@ async def lifespan(app: FastAPI):
     # instance that must not open Chrome over the service's windows.
     if _PREWARM:
         await get_browser(get_provider(DEFAULT_PROVIDER))
+    reaper = asyncio.create_task(_reap_loop()) if any(p.size > 1 for p in _pools.values()) else None
+    if reaper:
+        logger.info("Lanes: " + ", ".join(f"{n} x{p.size}" for n, p in _pools.items() if p.size > 1)
+                    + f" (extra lanes close after {_LANE_IDLE_SECONDS:.0f}s idle)")
     logger.info("Server ready.")
     yield
-    for b in _browsers.values():
-        try:
-            b.stop()
-        except Exception:
-            pass
+    if reaper:
+        reaper.cancel()
+    for group in LANES.values():
+        for lp in group:
+            if lp.key in _browsers or lp.key in _displays:
+                _stop_browser(lp, _browsers.get(lp.key))
 
 
 app = FastAPI(title="Browser LLM API", version=__version__, lifespan=lifespan)
@@ -1376,17 +1529,54 @@ async def api_status(request: Request = None):
     }
 
 
+def _lane_rows(name: str) -> list[dict]:
+    """One row per lane for /api/status: what it is doing and how long it has
+    been idle (the extra lanes close at BROWSER_LLM_LANE_IDLE_SECONDS)."""
+    rows = []
+    for row in _pools[name].snapshot():
+        lp = LANES[name][row["lane"]]
+        b = _browsers.get(lp.key)
+        row["number"] = row["lane"] + 1
+        row["browser_running"] = b is not None and not b.stopped
+        row["images_since_recycle"] = _img_gen_count.get(lp.key, 0)
+        rows.append(row)
+    return rows
+
+
+def _status_extra(name: str) -> dict:
+    """The provider's own status fields. They come from the lane that answered
+    last (its picker and its model), except the site's usage counter, which
+    belongs to the account and is taken from whichever lane read it most
+    recently."""
+    group = LANES[name]
+    last = _pools[name].last_lane
+    out = group[last if last is not None else 0].status_extra()
+    best = out.get("image_quota")
+    for lp in group:
+        quota = lp.status_extra().get("image_quota")
+        if quota and (not best or (quota.get("read_at") or 0) > (best.get("read_at") or 0)):
+            out["image_quota"] = best = quota
+    return out
+
+
 def _status_body() -> dict:
     providers = {}
     for name, p in PROVIDERS.items():
         m = _metrics[name]
         b = _browsers.get(name)
+        pool = _pools[name]
         providers[name] = {
             # not just cached — the Chrome process must actually still be alive
             # (b.stopped is a free returncode check, no browser I/O; the deeper
             # CDP-connection probe happens lazily in get_browser per request)
             "browser_running": b is not None and not b.stopped,
-            "busy": _locks[name].locked(),
+            # a request is running (on any lane): what "safe to restart" reads
+            "busy": pool.busy_count() > 0,
+            "lanes_total": pool.size,
+            "lanes_busy": pool.busy_count(),
+            "lanes_running": sum(1 for lane in pool.snapshot() if lane["browser_running"]),
+            "queued": pool.waiting(),
+            "lanes": _lane_rows(name),
             "supports_images": p.supports_images,
             "supports_upload": getattr(p, "supports_upload", False),
             # can its account-side conversation list be read and deleted?
@@ -1408,7 +1598,7 @@ def _status_body() -> dict:
             "images_allowed": name in IMAGE_PROVIDERS,
         }
         try:
-            providers[name].update(p.status_extra())
+            providers[name].update(_status_extra(name))
         except Exception as e:
             logger.debug(f"[{name}] status_extra failed: {e}")
     return {
@@ -1521,14 +1711,14 @@ async def api_history(request: Request, model: Optional[str] = None,
     provider = _history_provider(model)
     limit = max(1, min(int(limit or 200), 1000))
     offset = max(0, int(offset or 0))
-    async with _locks[provider.name]:
+    async with _lane(provider, cold_ok=False) as lane:
         try:
-            browser = await get_browser(provider)
-            async with provider.session_tab(browser) as page:
-                data = await provider.list_conversations(page, limit=limit,
-                                                        offset=offset)
+            browser = await get_browser(lane)
+            async with lane.session_tab(browser) as page:
+                data = await lane.list_conversations(page, limit=limit,
+                                                    offset=offset)
         except Exception as e:
-            await _evict_dead_browser(provider, e)
+            await _evict_dead_browser(lane, e)
             logger.error(f"[{provider.name}] history read failed: {e}", exc_info=True)
             raise HTTPException(status_code=502, detail=str(e))
     return {"model": provider.name, "limit": limit, "offset": offset, **data}
@@ -1542,11 +1732,11 @@ async def api_conversation(conv_id: str, request: Request,
     pulled at once."""
     _require_trusted(request, "reading a conversation from the account")
     provider = _history_provider(model)
-    async with _locks[provider.name]:
+    async with _lane(provider, cold_ok=False) as lane:
         try:
-            browser = await get_browser(provider)
-            async with provider.session_tab(browser) as page:
-                conv = await provider.fetch_conversation(page, conv_id)
+            browser = await get_browser(lane)
+            async with lane.session_tab(browser) as page:
+                conv = await lane.fetch_conversation(page, conv_id)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
         except RateLimited as e:
@@ -1575,16 +1765,16 @@ async def api_conversations_delete(req: ConversationDeleteRequest, request: Requ
     provider = _history_provider(req.model)
     deleted: list[str] = []
     why: dict = {}
-    async with _locks[provider.name]:
+    async with _lane(provider, cold_ok=False) as lane:
         try:
-            browser = await get_browser(provider)
-            async with provider.session_tab(browser) as page:
+            browser = await get_browser(lane)
+            async with lane.session_tab(browser) as page:
                 # The whole list in one page call. Per-id calls measured ~4s
                 # each, so a 70-chat clear-out held this request open for five
                 # minutes and looked to the operator like nothing happened.
-                deleted, why = await provider.delete_conversations(page, ids)
+                deleted, why = await lane.delete_conversations(page, ids)
         except Exception as e:
-            await _evict_dead_browser(provider, e)
+            await _evict_dead_browser(lane, e)
             logger.error(f"[{provider.name}] conversation delete failed: {e}", exc_info=True)
             raise HTTPException(status_code=502, detail=str(e))
     # The pictures go with the chat. The client can only name the files it saw
@@ -1749,17 +1939,15 @@ _GONE_PROBE_S = 0.1
 
 
 def _must_queue(name: str) -> bool:
-    """Whether a request arriving now waits for the provider's lock: it is held,
-    or freed with a waiter not yet woken (which goes first). Only a request that
-    waited is probed by _caller_gone, so one that never queued pays no delay."""
-    lock = _locks[name]
-    waiters = getattr(lock, "_waiters", None) or ()
-    return lock.locked() or any(not w.cancelled() for w in waiters)
+    """Whether a request arriving now waits for a lane: every lane is busy, or
+    someone is already waiting (and goes first). Only a request that waited is
+    probed by _caller_gone, so one that never queued pays no delay."""
+    return _pools[name].must_queue()
 
 
 async def _caller_gone(request: Optional[Request]) -> bool:
     """True when the caller has hung up. Asked once a request that had to
-    queue gets the provider's lock: a caller who gave up while waiting would otherwise hold the
+    queue gets a lane: a caller who gave up while waiting would otherwise hold the
     browser for an answer nobody reads, up to the drive's cap, while everything
     queued behind it waits.
 
@@ -1846,9 +2034,9 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             # rides out on the closing chunk (see _note_conversation).
             meta: dict = {}
             try:
-                async with _locks[provider.name]:
+                async with _lane(provider) as lane:
                     started = time.monotonic()  # reset: exclude queue-wait
-                    async for chunk in run_chat(provider, prompt, specs,
+                    async for chunk in run_chat(lane, prompt, specs,
                                                 allow_local_paths=allow_paths,
                                                 ephemeral=ephemeral,
                                                 meta=meta, variant=req.model_variant,
@@ -1873,7 +2061,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     # --- Non-streaming ---
     meta: dict = {}
     queued = _must_queue(provider.name)
-    async with _locks[provider.name]:
+    async with _lane(provider) as lane:
         if queued and await _caller_gone(request):
             # The caller left while queued: free the browser for the next one.
             logger.warning(f"[{provider.name}] caller left while queued; "
@@ -1881,7 +2069,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             raise HTTPException(status_code=499, detail="client closed the request while queued")
         started = time.monotonic()
         try:
-            text, imgs = await drive_once(provider, prompt, specs,
+            text, imgs = await drive_once(lane, prompt, specs,
                                           allow_local_paths=allow_paths,
                                           ephemeral=ephemeral,
                                           meta=meta, variant=req.model_variant,
@@ -2053,8 +2241,9 @@ async def _run_image_request(provider, prompt: str, specs: list, raw: Optional[l
             raise _quota_http(e)
     meta: dict = {}
     try:
-        queued = _must_queue(provider.name)
-        async with _locks[provider.name]:
+        gate = _image_gates[provider.name]
+        queued = _must_queue(provider.name) or gate.locked()
+        async with gate, _lane(provider) as lane:
             if queued and await _caller_gone(request):
                 # Left while queued: no drive, and the finally below gives a
                 # guest's reserved image back.
@@ -2064,7 +2253,7 @@ async def _run_image_request(provider, prompt: str, specs: list, raw: Optional[l
                                     detail="client closed the request while queued")
             started = time.monotonic()
             try:
-                text, imgs = await drive_once(provider, typed, specs, raw_uploads=raw,
+                text, imgs = await drive_once(lane, typed, specs, raw_uploads=raw,
                                               allow_local_paths=allow_local_paths,
                                               ephemeral=bool(guest),
                                               meta=meta, variant=variant, kind="image")
