@@ -15,6 +15,7 @@ All notable changes, newest first. Versions follow [semantic versioning](https:/
 
 - A non-streaming chat or image request whose caller hung up while it waited for the browser is now dropped when its turn comes, instead of running to its time limit for an answer nobody reads while the queue behind it waits. The check reads the connection directly, because `request.is_disconnected()` reports every caller as connected behind the API-key middleware.
 - Deleting a dashboard chat of several turns now deletes every conversation it made in the account. The server opens a new conversation for each turn, and the dashboard kept only the last one's id, so the earlier turns stayed in the account. Chats now record each turn's conversation (`convs`); a chat from before this keeps only its last.
+- `GET /api/history` answers 429 instead of 502 when the site refuses the first page for asking too often, as one conversation's read already did, so a dashboard import reads as "try again later" rather than broken.
 - `scripts/install-service.sh` now writes a working `Documentation=` line when the checkout's path holds a space. That line is a list of addresses split on spaces, so systemd ignored it; the installer now writes each space as `%20`.
 
 ## 2.1.0 — 2026-10-15

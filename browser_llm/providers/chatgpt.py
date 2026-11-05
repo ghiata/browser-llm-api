@@ -1128,7 +1128,7 @@ class ChatGPTProvider(Provider):
         try {
           const r = await fetch('/backend-api/conversations?offset=' + offset +
                                 '&limit=' + want + '&order=updated', {headers: H});
-          if (!r.ok) { out.error = 'list HTTP ' + r.status; break; }
+          if (!r.ok) { out.error = 'list HTTP ' + r.status; out.status = r.status; break; }
           j = await r.json();
         } catch (e) { out.error = 'list failed: ' + e; break; }
         const items = j.items || [];
@@ -1244,6 +1244,8 @@ class ChatGPTProvider(Provider):
               .replace("__OFFSET__", str(max(0, int(offset)))))
         data = await self._read_json(page, js)
         if data.get("error") and not data.get("conversations"):
+            if data.get("status") == 429:
+                raise RateLimited(data["error"])
             raise RuntimeError(data["error"])
         convs = data.get("conversations") or []
         logger.info(f"[{self.name}] listed {len(convs)} conversation(s) from the account")

@@ -1831,6 +1831,10 @@ async def api_history(request: Request, model: Optional[str] = None,
             async with lane.session_tab(browser) as page:
                 data = await lane.list_conversations(page, limit=limit,
                                                     offset=offset)
+        except RateLimited as e:
+            # The first page was refused: a pause fixes it, so say that rather
+            # than 502. A refusal after some pages comes back as `warning`.
+            raise HTTPException(status_code=429, detail=str(e))
         except Exception as e:
             await _evict_dead_browser(lane, e)
             logger.error(f"[{provider.name}] history read failed: {e}", exc_info=True)

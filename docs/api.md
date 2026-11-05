@@ -112,7 +112,7 @@ Generated images are saved under `BROWSER_LLM_IMAGE_DIR` (default `~/Pictures/br
 | `GET /api/status` | uptime, settings, and per provider: browser state, busy, telemetry (including `recent`, the last 40 requests as `{at, s, ok}`), model setting, image counter |
 | `GET /api/gallery?provider=&limit=&offset=` | saved images, newest first, with `total` and `has_more`; an image made through `/v1/images/*` since 2.1 carries `record` (brief, kind, prompt sent, model, size) |
 | `GET /api/design/kinds` | the design kinds with their default size and background |
-| `GET /api/history`, `GET /api/conversation/{id}` | the account's conversation list, and one conversation |
+| `GET /api/history`, `GET /api/conversation/{id}` | the account's conversation list, and one conversation; a list the site stopped part-way carries `warning`, so continue from `offset` + the count you got |
 | `POST /api/conversations/delete`, `POST /api/gallery/delete` | delete conversations from the account, and saved images from disk; `keep_images: true` deletes the conversations and keeps their images |
 | `POST /api/conversations/cleanup` | delete the conversations this server made for tools once they are `older_than` seconds old (default 3600); `dry_run: true` lists them instead; 409 while a request is in flight, or with `idle_only: false` only when no browser is free |
 | `GET /`, `/widget.js`, `/demo`, `/images/...` | the dashboard, the widget, its demo page, saved images |
@@ -126,7 +126,7 @@ The history, delete and cleanup endpoints reach into a signed-in account, so the
 | 400 | a malformed request, an unknown `kind`, or a file path from a caller that may not send one |
 | 401 | a request from another machine without the right key |
 | 403 | images are not allowed from this provider (`IMAGE_PROVIDERS`), or a cross-origin call to a history endpoint |
-| 429 | the site's usage limit; `Retry-After` and the detail give the reset time. Stop and wait. |
+| 429 | the site's usage limit; `Retry-After` and the detail give the reset time. Stop and wait. From `/api/history` or `/api/conversation/{id}`, the site is refusing reads because the account asked too often (a few hundred deletes or reads in a row can cause it for half an hour); try again later. |
 | 501 | the provider cannot do this (no image tool, no readable history) |
 | 502 | the site returned no image, or the drive failed; the detail quotes what the page said |
 
