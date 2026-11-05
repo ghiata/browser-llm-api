@@ -25,7 +25,7 @@ cp .env.example .env      # then edit
 | `BROWSER_LLM_PORT` | `8081` | port to bind |
 | `BROWSER_LLM_API_KEY` | unset | key required from callers on other machines on `/v1/*` and `/api/*` |
 | `BROWSER_LLM_GUEST_KEYS` | unset | keys for other people, `name:key:images` comma-separated; a guest reaches chat and images only and may make that many images in any 24 hours (see [below](#giving-someone-else-a-key)) |
-| `BROWSER_LLM_STATE_DIR` | `~/.local/state/browser-llm-api` | where the guests' image count is kept, so a restart does not reset it |
+| `BROWSER_LLM_STATE_DIR` | `~/.local/state/browser-llm-api` | where the guests' image count and the list of conversations made for tools (`conversations.json`, read by the cleanup) are kept, so a restart does not reset them |
 | `BROWSER_LLM_IMAGE_DIR` | `~/Pictures/browser-llm` | folder for saved images, one subfolder per provider |
 | `BROWSER_LLM_PUBLIC_URL` | `http://localhost:8081` | base of the image links the API returns; set it to this machine's address when others use the links |
 | `BROWSER_LLM_EPHEMERAL` | `0` | delete every chat's conversation afterwards unless the request says otherwise |

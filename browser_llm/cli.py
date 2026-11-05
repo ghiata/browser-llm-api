@@ -7,6 +7,7 @@
     browser-llm design kinds|prompt|set|tokens|review ...  designs as images
     browser-llm mcp                      the MCP stdio server for agent clients
     browser-llm health                   the running server's state, in short
+    browser-llm cleanup [options]        delete the conversations this server made
     browser-llm version
 
 ``serve`` and ``login`` use the browser profiles in the current directory, so
@@ -29,6 +30,7 @@ COMMANDS = {
     "design": "design sections, screens and brand images; tokens; review",
     "mcp": "run the MCP stdio server",
     "health": "show the running server's state",
+    "cleanup": "delete the conversations this server made, once an hour old",
     "version": "print the version",
 }
 
@@ -55,7 +57,7 @@ def _run_main(module, prog, rest, *, takes_argv=False):
 
 
 def health(base=None) -> int:
-    base = (base or os.environ.get("BROWSER_LLM_API") or "http://localhost:8081").rstrip("/")
+    base = _api_base(base)
     req = urllib.request.Request(base + "/api/status")
     key = os.environ.get("BROWSER_LLM_API_KEY", "").strip()
     if key:
@@ -89,6 +91,103 @@ def health(base=None) -> int:
     return 0
 
 
+def _api_base(base=None) -> str:
+    port = os.environ.get("BROWSER_LLM_PORT", "").strip() or "8081"
+    return (base or os.environ.get("BROWSER_LLM_API") or f"http://localhost:{port}").rstrip("/")
+
+
+def _post_json(url: str, body: dict, timeout: float = 600):
+    """POST JSON; returns (status, parsed body). Raises URLError/OSError when
+    the server cannot be reached."""
+    req = urllib.request.Request(url, data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"})
+    key = os.environ.get("BROWSER_LLM_API_KEY", "").strip()
+    if key:
+        req.add_header("Authorization", f"Bearer {key}")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, json.load(r)
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.load(e)
+        except ValueError:
+            return e.code, {"detail": str(e)}
+
+
+def cleanup(argv, *, post=_post_json, sleep=None, clock=None) -> int:
+    """Ask the running server to delete the conversations it made (its ledger)
+    that are older than --older-than minutes. What the hourly timer runs.
+
+    The server never waits for a browser: it answers 409 while it is working.
+    This retries every --retry seconds, first waiting for the provider to be
+    idle, then after --busy-after minutes taking any free browser, and gives up
+    after --wait minutes (the next hour's run picks the rest up). Exit 0 when
+    the run finished or gave up because the server stayed busy, 1 on an error.
+    """
+    import argparse
+    import time
+    sleep = sleep or time.sleep
+    clock = clock or time.monotonic
+    ap = argparse.ArgumentParser(prog="browser-llm cleanup", description=cleanup.__doc__.split("\n\n")[0])
+    ap.add_argument("--older-than", type=float, default=60, metavar="MIN",
+                    help="only conversations made at least this many minutes ago (default 60)")
+    ap.add_argument("--model", default="chatgpt-browser", help="provider (default chatgpt-browser)")
+    ap.add_argument("--dry-run", action="store_true", help="say what would go; delete nothing")
+    ap.add_argument("--wait", type=float, default=50, metavar="MIN",
+                    help="give up after this many minutes of a busy server (default 50)")
+    ap.add_argument("--busy-after", type=float, default=20, metavar="MIN",
+                    help="after this many minutes, run beside a request on a free browser (default 20)")
+    ap.add_argument("--retry", type=float, default=30, metavar="SEC",
+                    help="seconds between tries while the server is busy (default 30)")
+    ap.add_argument("--api", default=None, help="server address (default $BROWSER_LLM_API or http://localhost:8081)")
+    a = ap.parse_args(argv)
+    url = _api_base(a.api) + "/api/conversations/cleanup"
+    start = clock()
+    unreachable = 0
+    while True:
+        waited = (clock() - start) / 60
+        body = {"model": a.model, "older_than": max(0.0, a.older_than) * 60,
+                "dry_run": a.dry_run, "idle_only": waited < a.busy_after}
+        try:
+            status, data = post(url, body)
+            unreachable = 0
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            # A restart takes a few seconds; anything longer is a real fault.
+            unreachable += 1
+            if unreachable >= 5 or waited >= a.wait:
+                print(f"cleanup: {url} unreachable ({e})", file=sys.stderr)
+                return 1
+            sleep(a.retry)
+            continue
+        if status == 409:
+            if waited >= a.wait:
+                print(f"cleanup: the server stayed busy for {a.wait:.0f} min; "
+                      f"left for the next run ({data.get('detail', '')})", file=sys.stderr)
+                return 0
+            sleep(a.retry)
+            continue
+        if status != 200:
+            print(f"cleanup: HTTP {status}: {data.get('detail', data)}", file=sys.stderr)
+            return 1
+        mins = f"{a.older_than:g} min"
+        if data.get("dry_run"):
+            print(f"cleanup {data.get('model')}: would delete {data.get('due', 0)} recorded "
+                  f"conversation(s) older than {mins} ({data.get('recorded', 0)} recorded in all)")
+            for cid in data.get("ids") or []:
+                print(f"  {cid}")
+            return 0
+        line = (f"cleanup {data.get('model')}: deleted {len(data.get('deleted') or [])} of "
+                f"{data.get('due', 0)} recorded conversation(s) older than {mins}")
+        if data.get("already_gone"):
+            line += f", {len(data['already_gone'])} already gone"
+        if data.get("failed"):
+            line += f", {len(data['failed'])} failed (tried again next run)"
+        if data.get("stopped"):
+            line += f"; stopped early: {data['stopped']}"
+        print(line)
+        return 0
+
+
 def main(argv=None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     if not args or args[0] in ("-h", "--help", "help"):
@@ -119,6 +218,8 @@ def main(argv=None) -> int:
         return _run_main(mcp_server, prog, rest) or 0
     if cmd == "health":
         return health(rest[0] if rest else None)
+    if cmd == "cleanup":
+        return cleanup(rest)
     print(f"browser-llm: unknown command {cmd!r}\n\n{_usage()}", file=sys.stderr)
     return 2
 

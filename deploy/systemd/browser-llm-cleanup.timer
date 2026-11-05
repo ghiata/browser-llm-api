@@ -1,0 +1,12 @@
+[Unit]
+Description=Delete the conversations browser-llm-api made, every hour
+
+[Timer]
+# Each run deletes only the conversations the server wrote in its ledger that
+# are at least an hour old (docs/running.md, "Cleaning up the account").
+OnCalendar=hourly
+RandomizedDelaySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

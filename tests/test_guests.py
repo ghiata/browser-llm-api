@@ -233,7 +233,7 @@ class GuestChat(unittest.IsolatedAsyncioTestCase):
             return "hello", [dict(i) for i in imgs]
         req = server.ChatCompletionRequest(messages=[{"role": "user", "content": "draw a cat"}],
                                            ephemeral=False, timeout=timeout)
-        request = SimpleNamespace(state=SimpleNamespace(guest=guest))
+        request = SimpleNamespace(state=SimpleNamespace(guest=guest), headers={})
         with mock.patch.object(server, "drive_once", drive), \
                 mock.patch.object(server, "QUOTA", self.quota), \
                 mock.patch.object(server, "_client_may_send_paths", lambda r: False):
@@ -242,6 +242,7 @@ class GuestChat(unittest.IsolatedAsyncioTestCase):
     async def test_a_guest_chat_is_always_deleted(self):
         await self.chat(self.guest)
         self.assertTrue(self.seen["ephemeral"])
+        self.assertTrue(self.seen["track"])      # and written down for the cleanup
 
     async def test_images_drawn_in_chat_count(self):
         await self.chat(self.guest, [{"b64": png_b64(), "mime": "image/png",

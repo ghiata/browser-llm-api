@@ -1,0 +1,12 @@
+[Unit]
+Description=browser-llm-api cleanup — delete the conversations the server made, once an hour old
+Documentation=file://__INSTALL_DIR__/docs/running.md
+After=browser-llm-api.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=__INSTALL_DIR__
+# Waits up to 50 min for the server to be free (it never deletes while a
+# request is running), then leaves the rest for the next hour.
+ExecStart="__INSTALL_DIR__/venv/bin/python" -m browser_llm cleanup
+TimeoutStartSec=55min

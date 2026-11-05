@@ -126,6 +126,17 @@ class LanePool:
                 self._waiters.remove(w)
             raise
 
+    def try_acquire(self, *, cold_ok: bool = False) -> Optional[int]:
+        """Take a lane now or not at all. None when a request is already
+        waiting (it comes first) or no lane is free. For background work that
+        must never hold up a request (the hourly conversation cleanup)."""
+        if self.waiting():
+            return None
+        lane = self._pick(cold_ok)
+        if lane is not None:
+            self._busy.add(lane)
+        return lane
+
     def release(self, lane: int, *, down_for: float = 0.0, served: bool = True) -> None:
         """Give a lane back. ``down_for`` keeps it out of the pool that many
         seconds, for a lane that failed to start. ``served`` is False when the

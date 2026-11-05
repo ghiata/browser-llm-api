@@ -38,7 +38,7 @@ Extra fields this server understands:
 | `ephemeral` | `true` deletes the conversation from the account once the answer is read |
 | `images` | a shorthand list of image specs, attached alongside any in the messages |
 
-**Ephemeral requests.** The sessions are signed in as a person, so every call lands in that person's chat history. `"ephemeral": true` deletes the conversation as soon as the answer has been read, with the same soft delete the site's own Delete performs. A failed delete never fails the request. Without the field, `BROWSER_LLM_EPHEMERAL` decides (default off). Image requests are never deleted, because an asset usually comes with a thread worth keeping. The MCP `ask` tool sets it by default.
+**Ephemeral requests.** The sessions are signed in as a person, so every call lands in that person's chat history. `"ephemeral": true` deletes the conversation as soon as the answer has been read, with the same soft delete the site's own Delete performs. A failed delete never fails the request. Without the field, `BROWSER_LLM_EPHEMERAL` decides (default off). Image requests are not deleted straight away; the hourly cleanup removes them after an hour when it is on (see [Running it](running.md#cleaning-up-the-account)). The MCP `ask` tool sets it by default.
 
 A multi-turn `messages` array is flattened into one prompt, with labelled turns, and sent to a fresh chat. `usage` token counts are word counts, not a tokenizer's.
 
@@ -113,10 +113,11 @@ Generated images are saved under `BROWSER_LLM_IMAGE_DIR` (default `~/Pictures/br
 | `GET /api/gallery?provider=&limit=&offset=` | saved images, newest first, with `total` and `has_more`; an image made through `/v1/images/*` since 2.1 carries `record` (brief, kind, prompt sent, model, size) |
 | `GET /api/design/kinds` | the design kinds with their default size and background |
 | `GET /api/history`, `GET /api/conversation/{id}` | the account's conversation list, and one conversation |
-| `POST /api/conversations/delete`, `POST /api/gallery/delete` | delete conversations from the account, and saved images from disk |
+| `POST /api/conversations/delete`, `POST /api/gallery/delete` | delete conversations from the account, and saved images from disk; `keep_images: true` deletes the conversations and keeps their images |
+| `POST /api/conversations/cleanup` | delete the conversations this server made for tools once they are `older_than` seconds old (default 3600); `dry_run: true` lists them instead; 409 while a request is in flight, or with `idle_only: false` only when no browser is free |
 | `GET /`, `/widget.js`, `/demo`, `/images/...` | the dashboard, the widget, its demo page, saved images |
 
-The four history and delete endpoints reach into a signed-in account, so they answer only callers on the server's own origin. A page on another site gets 403, even from this machine. Only ChatGPT exposes a conversation list this server can read; Gemini answers 501.
+The history, delete and cleanup endpoints reach into a signed-in account, so they answer only callers on the server's own origin. A page on another site gets 403, even from this machine. Only ChatGPT exposes a conversation list this server can read; Gemini answers 501.
 
 ## Errors
 

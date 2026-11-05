@@ -111,8 +111,11 @@ browser_llm/                 # THE PACKAGE. Imports inside it are relative (from
   guests.py                  #   stdlib-only guest keys: parse_guest_keys (name:key:images),
                              #   ImageQuota (rolling 24 h per guest, reserve/commit/release, JSON
                              #   in BROWSER_LLM_STATE_DIR).
-  lanes.py                   #   stdlib-only: LanePool (which lane a request takes), clone_login (copy
-                             #   lane 0's cookies), PrivateDisplay (an Xvfb per extra lane).
+  ledger.py                  #   stdlib-only ConversationLedger: the conversations made for tools,
+                             #   in BROWSER_LLM_STATE_DIR/conversations.json, read by the cleanup.
+  lanes.py                   #   stdlib-only: LanePool (which lane a request takes, try_acquire for
+                             #   background work), clone_login (copy lane 0's cookies),
+                             #   PrivateDisplay (an Xvfb per extra lane).
   providers/
     __init__.py              #   PROVIDERS registry, LANES, get_provider, DEFAULT_PROVIDER, IMAGE_PROVIDERS
     limits.py                #   UsageLimitReached, quota_refusal, refusal_from_message → HTTP 429
@@ -149,7 +152,8 @@ scripts/                     # each cd's to the checkout root first.
   mode.sh                    #   service display: headless (Xvfb) / visible.
   github-settings.sh         #   repo description, topics, settings. Needs an ADMIN (push access
                              #   gets 404); --dry-run shows the calls.
-deploy/systemd/              # browser-llm-api.service.template, browser-llm-health.{service.template,timer}
+deploy/systemd/              # browser-llm-api.service.template, browser-llm-health.{service.template,timer},
+                             #   browser-llm-cleanup.{service.template,timer} (enabled by --cleanup)
 desktop/                     # GTK3 tray app on SYSTEM python3 (PyGObject), stdlib only, a thin HTTP
                              #   client. GTK3 on purpose: AppIndicator is GTK3-only.
 docs/                        # user docs; design-upgrade.md is the 0.5.0 audit and measured run.
@@ -168,9 +172,9 @@ gen_asset.py design.py client.py serve.sh mcp.sh healthcheck.sh
 
 **Tests:** `./venv/bin/python -m unittest discover -s tests` (no browser, no network). Each file is
 named for what it covers (completion tracker, authz, attachments, MCP, history, visibility, ChatGPT
-page selectors, Plus limits, design, gallery records, widget, dashboard, guests). Extend them when
-you change the done-decision logic, the attachment layer, or anything that decides who may read or
-delete an account's history. Ruff selects E/F/W only; keep it clean.
+page selectors, Plus limits, design, gallery records, widget, dashboard, guests, lanes, cleanup).
+Extend them when you change the done-decision logic, the attachment layer, or anything that decides
+who may read or delete an account's history, or which conversations the cleanup may delete. Ruff selects E/F/W only; keep it clean.
 
 **Deps live in `./venv`** (system Python is PEP-668): `scripts/ensure-venv.sh` builds it. Use
 `./venv/bin/python -m pip …`, not `./venv/bin/pip …` (a venv older than a folder rename has a stale
@@ -296,7 +300,9 @@ handler passes the yielded lane to `get_browser`, `run_chat` and `drive_once`, n
   install reads exactly as before. `PROVIDERS[name]` stays lane 0.
 - **Extra lanes start only when every running lane is busy**, and close after
   `BROWSER_LLM_LANE_IDLE_SECONDS` (`_reap_idle_lanes`, every 30 s). `cold_ok=False` (history read and
-  delete) never starts one; it waits for a running lane.
+  delete) never starts one; it waits for a running lane. `wait=False` (the cleanup) never waits:
+  `LanePool.try_acquire` gives a lane now or None, and None when a request is queued, so `_lane`
+  raises `NoFreeLane` (HTTP 409).
 - **An extra lane = its own profile dir + its own Xvfb.** `clone_login` copies lane 0's `Cookies`
   through SQLite's backup call (read-only on the source, consistent while Chrome has it open) and
   replaces the lane's copy each time it starts; `Local State` is copied once. This works because
@@ -349,7 +355,9 @@ falls back to `BROWSER_LLM_EPHEMERAL` (`_EPHEMERAL_DEFAULT`, off).
   `PATCH /backend-api/conversation/<id>` `{"is_visible": false}`, exactly what the sidebar's Delete
   does; it survives a sidebar redesign.
 - **A failed delete never fails the request** (`_discard` logs and swallows).
-- Image generation is deliberately not covered.
+- Image generation is deliberately not covered; the hourly cleanup (below) removes those threads.
+- A successful ephemeral delete takes the id off the cleanup's ledger (`_ConversationWatch.deleted`);
+  a failed one leaves it there for the cleanup.
 - The MCP `ask` tool sets it by default (`keep_chat: true` opts out); `client.ask()` takes
   `ephemeral=`. Tests: `AskEphemeralTest` in `tests/test_mcp.py`.
 
@@ -397,6 +405,37 @@ removes the local chat, its images and the thread on the site.
 - **The dashboard sends `ephemeral: false`** on every chat completion; without it an install with
   `BROWSER_LLM_EPHEMERAL=1` would delete every dashboard chat on the site. The `conversation_id`
   round-trips (`_note_conversation` → the closing SSE chunk / `body["conversation_id"]`).
+
+## Account cleanup: the ledger and the hourly timer
+
+Every drive opens a conversation on the account, and tool traffic buries the owner's own chats in
+the site's sidebar. The account cannot tell them apart afterwards, so the server writes each tool
+conversation down when the site makes it, and the cleanup deletes what is written down and nothing
+else.
+
+- **`LEDGER`** (`ledger.ConversationLedger`, `BROWSER_LLM_STATE_DIR/conversations.json`, mode 600,
+  atomic writes; a damaged file starts empty, which can only leave tool chats behind).
+- **Written as soon as the URL holds the id**: `_stream_completion(on_conversation=)` reads
+  `_read_conversation_id` every 2 s once the turn started, so a request that times out, fails or
+  loses its caller is still recorded. `_ConversationWatch` (in `run_chat`/`drive_once`) notes it,
+  adds it to `_live_conversations` for the drive's life, and forgets it after a successful ephemeral
+  delete.
+- **Who is recorded** (`_tracked`): every caller except the dashboard, i.e. no `Origin` (curl, MCP,
+  scripts, design.py), another site's origin (the widget), `null`, and every guest. A same-origin
+  caller is a person in the dashboard, which keeps its own list and cascades its own deletes.
+- **`POST /api/conversations/cleanup`** (`_require_trusted`, not on the guest allowlist): ids from
+  `LEDGER.due(older_than)` minus `_live_conversations`, deleted with `delete_conversations` in
+  chunks of `_MAX_BULK_DELETE`. It never deletes images. With `idle_only` it answers 409 unless
+  `_provider_idle` (no lane busy, nobody queued, image gate free); it takes its lane with
+  `_lane(cold_ok=False, wait=False)` and stops between chunks when another request arrives.
+  Deleted, 404 and malformed ids leave the ledger; other failures count `attempts` and are dropped
+  after `ledger.MAX_ATTEMPTS` (24).
+- **`browser-llm cleanup`** (cli.py, no server import) is what `browser-llm-cleanup.timer` runs
+  hourly: retries a 409 every 30 s, sends `idle_only: false` after 20 min, gives up quietly after 50.
+- **Never widen what the cleanup deletes** to titles, dates or "looks like a tool prompt": a delete
+  cannot be undone. One-off sweeps of older threads go through `/api/conversations/delete` with an
+  exact id list and `keep_images: true`.
+- Tests: tests/test_cleanup.py.
 
 ## Configuration (env vars)
 

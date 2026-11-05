@@ -74,7 +74,7 @@ from .providers import (
     CompletionTracker, RateLimited, UsageLimitReached,
 )
 from .providers.limits import refusal_from_message
-from . import authz, config, design, guests, lanes
+from . import authz, config, design, guests, lanes, ledger
 from ._version import __version__
 
 # ---------------------------------------------------------------------------
@@ -321,6 +321,9 @@ API_KEY = os.environ.get("BROWSER_LLM_API_KEY", "").strip()
 # Other people's keys, each with an image allowance per 24 hours (guests.py).
 GUESTS = guests.parse_guest_keys(os.environ.get("BROWSER_LLM_GUEST_KEYS"), API_KEY)
 QUOTA = guests.ImageQuota(guests.default_state_dir() / "guest-images.json")
+# Conversations this server made on the account, for the hourly cleanup
+# (ledger.py, POST /api/conversations/cleanup).
+LEDGER = ledger.ConversationLedger(guests.default_state_dir() / "conversations.json")
 if GUESTS:
     logging.getLogger("gemini_server").info(
         "guest keys: " + ", ".join(f"{g.name} ({g.images_per_day} images per 24 h)"
@@ -391,9 +394,22 @@ class ChatCompletionRequest(BaseModel):
 
 class ConversationDeleteRequest(BaseModel):
     """Delete these conversations from the provider's account. Destructive on
-    someone's real history, hence the same-origin gate on the endpoint."""
+    someone's real history, hence the same-origin gate on the endpoint.
+    ``keep_images`` leaves the saved image files of those conversations alone
+    (a clean-up of the account, not of the gallery)."""
     model: Optional[str] = None
     ids: list[str] = []
+    keep_images: bool = False
+
+
+class ConversationCleanupRequest(BaseModel):
+    """Delete the conversations this server made and wrote in its ledger once
+    they are ``older_than`` seconds old. ``idle_only`` runs only while nothing
+    is in flight on the provider; ``dry_run`` reports what would go."""
+    model: Optional[str] = None
+    older_than: float = 3600
+    dry_run: bool = False
+    idle_only: bool = True
 
 
 class GalleryDeleteRequest(BaseModel):
@@ -718,8 +734,13 @@ async def _ready_extra_lane(provider) -> None:
         _verified_lanes.add(key)
 
 
+class NoFreeLane(RuntimeError):
+    """Every lane is busy or a request is waiting, and the caller asked not to
+    wait (``_lane(..., wait=False)``)."""
+
+
 @asynccontextmanager
-async def _lane(provider, *, cold_ok: bool = True):
+async def _lane(provider, *, cold_ok: bool = True, wait: bool = True):
     """Take one of the provider's lanes for one request and yield that lane's
     Provider, which the request must use in place of ``provider``.
 
@@ -727,10 +748,17 @@ async def _lane(provider, *, cold_ok: bool = True):
     request waits only when every lane is busy). An extra lane that cannot start
     or is signed out is left alone for _LANE_RETRY_SECONDS and the request takes
     another lane. ``cold_ok=False`` is for work not worth starting a Chrome for.
+    ``wait=False`` raises NoFreeLane instead of queueing, for background work
+    that must never hold up a request.
     """
     pool = _pools[provider.name]
     while True:
-        i = await pool.acquire(cold_ok=cold_ok)
+        if wait:
+            i = await pool.acquire(cold_ok=cold_ok)
+        else:
+            i = pool.try_acquire(cold_ok=cold_ok)
+            if i is None:
+                raise NoFreeLane(f"every {provider.name} lane is busy or has a request waiting")
         lp = LANES[provider.name][i]
         if i == 0:
             break
@@ -1035,7 +1063,8 @@ def _extended_deadline(start, deadline, *, streaming, generating,
 
 
 async def _stream_completion(provider, page, monitor,
-                             timeout: Optional[float] = None) -> AsyncGenerator[str, None]:
+                             timeout: Optional[float] = None,
+                             on_conversation=None) -> AsyncGenerator[str, None]:
     """
     Poll the response, yielding text deltas as they grow; return when complete.
 
@@ -1047,8 +1076,16 @@ async def _stream_completion(provider, page, monitor,
     while a stalled request still gives up near ``_BASE_DEADLINE``. A request's
     own ``timeout`` replaces the thinking cap and bounds the rest (see
     ``_request_caps``).
+
+    ``on_conversation(id)`` is called once, as soon as the page shows which
+    conversation the site made for this drive. That is early on purpose: a
+    request that later times out, fails or loses its caller still leaves the
+    conversation on the account, and the cleanup can only delete what was
+    written down.
     """
     tracker = CompletionTracker()
+    conv_seen = on_conversation is None
+    conv_next_try = 0.0
     start = time.monotonic()
     base, stream_cap, think_cap = _request_caps(timeout)
     if timeout is not None:
@@ -1097,6 +1134,17 @@ async def _stream_completion(provider, page, monitor,
         cdp_done = monitor.stream_done.is_set()
         # Only needed until the answer shows any sign of life (see "nostart").
         submitted = None if tracker.started else await provider.has_user_turn(page)
+        if not conv_seen and (tracker.started or submitted) and now >= conv_next_try:
+            # The site puts the id in the URL once it has made the
+            # conversation, shortly after our turn appears.
+            conv_next_try = now + 2.0
+            conv_id = await _read_conversation_id(provider, page)
+            if conv_id:
+                conv_seen = True
+                try:
+                    on_conversation(conv_id)
+                except Exception as e:
+                    logger.warning(f"[{provider.name}] could not record conversation: {e}")
 
         chunk, done = tracker.feed(now, raw, is_gen, img, cdp_done=cdp_done,
                                    submitted=submitted)
@@ -1139,14 +1187,16 @@ def _ephemeral(req: "ChatCompletionRequest") -> bool:
     return _EPHEMERAL_DEFAULT if req.ephemeral is None else bool(req.ephemeral)
 
 
-async def _discard(provider, page) -> None:
-    """Delete the conversation an ephemeral request just created. Never raises:
-    the answer has already been read, and losing the cleanup is a tidier failure
-    than losing the response."""
+async def _discard(provider, page) -> bool:
+    """Delete the conversation an ephemeral request just created; True when the
+    site took the delete. Never raises: the answer has already been read, and
+    losing the cleanup is a tidier failure than losing the response. A failed
+    delete stays in the ledger, so the hourly cleanup tries again."""
     try:
-        await provider.discard_conversation(page)
+        return bool(await provider.discard_conversation(page))
     except Exception as e:
         logger.warning(f"[{provider.name}] discard_conversation failed: {e}")
+        return False
 
 
 async def _read_conversation_id(provider, page) -> str:
@@ -1165,6 +1215,39 @@ def _note_conversation(meta: Optional[dict], conv_id: str) -> None:
     a cascade, not the answer."""
     if meta is not None and conv_id:
         meta["conversation_id"] = conv_id
+
+
+# Conversations a drive is still working in. The cleanup never deletes one of
+# these, whatever its age: a request may run 25 minutes.
+_live_conversations: set[str] = set()
+
+
+class _ConversationWatch:
+    """What one drive does with the conversation the site made for it: write it
+    in the ledger so the hourly cleanup can delete it (unless ``track`` is
+    False: a person's chat from the dashboard), mark it in use until the drive
+    ends, and take it off the ledger once an ephemeral request has deleted it."""
+
+    def __init__(self, provider, kind: str, track: bool):
+        self.provider = provider
+        self.kind = kind
+        self.track = track
+        self.id = ""
+
+    def seen(self, conv_id: str) -> None:
+        if self.id or not conv_id:
+            return
+        self.id = conv_id
+        _live_conversations.add(conv_id)
+        if self.track:
+            LEDGER.note(conv_id, provider=self.provider.name, kind=self.kind)
+
+    def deleted(self) -> None:
+        if self.id:
+            LEDGER.forget([self.id])
+
+    def close(self) -> None:
+        _live_conversations.discard(self.id)
 
 
 async def _read_model_used(provider, page, monitor, options: dict) -> dict:
@@ -1210,14 +1293,17 @@ async def run_chat(provider, prompt: str, attachments: Optional[list] = None, *,
                    ephemeral: bool = False,
                    meta: Optional[dict] = None,
                    variant: Optional[str] = None,
-                   timeout: Optional[float] = None) -> AsyncGenerator[str, None]:
+                   timeout: Optional[float] = None,
+                   track: bool = True) -> AsyncGenerator[str, None]:
     """Open the provider's chat, attach any input images, send the prompt, stream
     text deltas, then append any generated images as markdown links.
 
     ``ephemeral`` deletes the conversation from the account once the answer has
     been read, for callers whose prompts are tooling rather than conversation.
-    ``variant`` is the request's model_variant (see Provider.prepare_page)."""
+    ``variant`` is the request's model_variant (see Provider.prepare_page).
+    ``track`` writes the conversation in the ledger for the hourly cleanup."""
     browser = await get_browser(provider)
+    watch = _ConversationWatch(provider, "chat", track)
     try:
         async with _attachment_files(attachments, raw_uploads,
                                      allow_local_paths=allow_local_paths) as files:
@@ -1225,17 +1311,19 @@ async def run_chat(provider, prompt: str, attachments: Optional[list] = None, *,
             page, monitor = await provider.open_and_send(browser, prompt, attachments=files,
                                                          options=options)
 
-            async for delta in _stream_completion(provider, page, monitor, timeout=timeout):
+            async for delta in _stream_completion(provider, page, monitor, timeout=timeout,
+                                                  on_conversation=watch.seen):
                 yield delta
 
             used = await _read_model_used(provider, page, monitor, options)
             if meta is not None and used:
                 meta["model_used"] = used
             # Before the images, not after: the id becomes part of their names.
-            conv_id = "" if ephemeral else await _read_conversation_id(provider, page)
+            conv_id = await _read_conversation_id(provider, page)
+            watch.seen(conv_id)
             n = 0
             for im in await provider.get_images(page):
-                _persist(im, provider, conv_id)
+                _persist(im, provider, "" if ephemeral else conv_id)
                 n += 1
                 if meta is not None:
                     meta.setdefault("images", []).append(Path(im.get("path") or "").name)
@@ -1244,12 +1332,15 @@ async def run_chat(provider, prompt: str, attachments: Optional[list] = None, *,
             if n:
                 _note_image_gen(provider)  # count toward browser recycle
             if ephemeral:
-                await _discard(provider, page)
+                if await _discard(provider, page):
+                    watch.deleted()
             else:
                 _note_conversation(meta, conv_id)
     except Exception as e:
         await _evict_dead_browser(provider, e)
         raise
+    finally:
+        watch.close()
 
     # Leave the tab open — closing or navigating away disrupts the browser.
 
@@ -1261,11 +1352,14 @@ async def drive_once(provider, prompt: str, attachments: Optional[list] = None, 
                      meta: Optional[dict] = None,
                      variant: Optional[str] = None,
                      kind: str = "chat",
-                     timeout: Optional[float] = None) -> tuple[str, list[dict]]:
+                     timeout: Optional[float] = None,
+                     track: bool = True) -> tuple[str, list[dict]]:
     """Non-streaming drive used by non-streaming chat and the images endpoints:
     returns (text, images). ``kind`` "image" makes the provider read the
-    site's own image counter first (see Provider.prepare_page)."""
+    site's own image counter first (see Provider.prepare_page). ``track`` as
+    in run_chat."""
     browser = await get_browser(provider)
+    watch = _ConversationWatch(provider, kind, track)
     try:
         async with _attachment_files(attachments, raw_uploads,
                                      allow_local_paths=allow_local_paths) as files:
@@ -1281,24 +1375,29 @@ async def drive_once(provider, prompt: str, attachments: Optional[list] = None, 
                 # one by 900 s): a stuck image must not hold the browser 25 min,
                 # and its clients wait 440 s.
                 timeout = _BASE_DEADLINE
-            async for delta in _stream_completion(provider, page, monitor, timeout=timeout):
+            async for delta in _stream_completion(provider, page, monitor, timeout=timeout,
+                                                  on_conversation=watch.seen):
                 text += delta
             used = await _read_model_used(provider, page, monitor, options)
             if meta is not None and used:
                 meta["model_used"] = used
-            conv_id = "" if ephemeral else await _read_conversation_id(provider, page)
-            imgs = [_persist(im, provider, conv_id)
+            conv_id = await _read_conversation_id(provider, page)
+            watch.seen(conv_id)
+            imgs = [_persist(im, provider, "" if ephemeral else conv_id)
                     for im in await provider.get_images(page)]
             if imgs:
                 _note_image_gen(provider)  # count toward browser recycle
             if ephemeral:
-                await _discard(provider, page)
+                if await _discard(provider, page):
+                    watch.deleted()
             else:
                 _note_conversation(meta, conv_id)
             return text, imgs
     except Exception as e:
         await _evict_dead_browser(provider, e)
         raise
+    finally:
+        watch.close()
 
 
 def _prevalidate_specs(specs: list, *, allow_local_paths: bool) -> None:
@@ -1685,6 +1784,21 @@ def _require_trusted(request: Request, what: str) -> None:
                    f"Open the dashboard on this server's own address instead.")
 
 
+def _tracked(request: Optional[Request], guest=None) -> bool:
+    """Whether a request's conversation goes in the ledger for the hourly
+    cleanup. Everything except a person's own chat on the dashboard, which is a
+    page on this server's own address (it sends that as its Origin, and keeps
+    its own copy of the chat). curl, scripts, the MCP tools and the desktop app
+    send no Origin; another site's page, such as one carrying the widget, sends
+    its own. A guest's conversation is always tracked."""
+    if guest or request is None:
+        return True
+    origin = (request.headers.get("origin") or "").strip()
+    if not origin or origin == "null":
+        return True
+    return not authz.origin_is_trusted(origin, request.headers.get("host"))
+
+
 def _history_provider(model: Optional[str]):
     """The provider whose account history we are about to touch, or a 4xx/501
     explaining why we can't."""
@@ -1781,7 +1895,7 @@ async def api_conversations_delete(req: ConversationDeleteRequest, request: Requ
     # itself, which for an imported conversation is none of them, so the sweep
     # happens here where the filenames are.
     images: list[str] = []
-    for path in _conversation_images(ids):
+    for path in ([] if req.keep_images else _conversation_images(ids)):
         try:
             _unlink_saved(path)
             images.append(path.name)
@@ -1790,11 +1904,89 @@ async def api_conversations_delete(req: ConversationDeleteRequest, request: Requ
         except Exception as e:
             logger.warning(f"could not delete {path}: {e}")
     gone, why = _split_already_gone(why)
+    LEDGER.forget(deleted + gone)
     logger.info(f"[{provider.name}] deleted {len(deleted)}/{len(ids)} conversation(s)"
                 + (f", {len(gone)} already gone" if gone else "")
                 + f", and {len(images)} of their image(s)")
     return {"model": provider.name, "deleted": deleted, "already_gone": gone,
             "failed": list(why), "why": why, "images_deleted": images}
+
+
+def _provider_idle(name: str) -> bool:
+    """Nothing in flight on the provider: no lane busy, nobody queued, no image
+    request holding or waiting at the image gate."""
+    pool = _pools[name]
+    gate = _image_gates.get(name)
+    return (pool.busy_count() == 0 and pool.waiting() == 0
+            and not (gate is not None and gate.locked()))
+
+
+@app.post("/api/conversations/cleanup")
+async def api_conversations_cleanup(req: ConversationCleanupRequest, request: Request):
+    """Delete the conversations this server made on the account (the ledger,
+    see ledger.py) once they are ``older_than`` seconds old. Run hourly by
+    ``browser-llm cleanup`` from a systemd timer.
+
+    Only ids in the ledger are touched, so a person's own chats on the account
+    are safe whatever they are called, and so are the dashboard's (never
+    written down). A conversation a drive is still working in is skipped
+    whatever its age. Saved images stay: they are the caller's output.
+
+    It never waits for a lane. With ``idle_only`` (the default) it answers 409
+    while anything is in flight; without it, 409 only when no lane is free or a
+    request is queued. Between batches it stops early if another request arrives."""
+    _require_trusted(request, "cleaning up conversations on the account")
+    provider = _history_provider(req.model)
+    older = max(0.0, float(req.older_than))
+    due = [i for i in LEDGER.due(older, provider.name) if i not in _live_conversations]
+    report = {"model": provider.name, "older_than": older, "due": len(due),
+              "recorded": len(LEDGER), "dry_run": bool(req.dry_run)}
+    if req.dry_run or not due:
+        return {**report, "ids": due if req.dry_run else [], "deleted": [],
+                "already_gone": [], "failed": [], "why": {}, "stopped": None}
+    if req.idle_only and not _provider_idle(provider.name):
+        raise HTTPException(status_code=409,
+                            detail=f"{provider.name} is working on a request; try again later")
+    deleted: list[str] = []
+    why: dict = {}
+    stopped = None
+    pool = _pools[provider.name]
+    try:
+        async with _lane(provider, cold_ok=False, wait=False) as lane:
+            # A request that arrives meanwhile either queues or starts another
+            # lane; either way the cleanup gives way after the batch in hand.
+            busy_at_start = pool.busy_count()
+            try:
+                browser = await get_browser(lane)
+                async with lane.session_tab(browser) as page:
+                    for k in range(0, len(due), _MAX_BULK_DELETE):
+                        if k and (pool.waiting() or pool.busy_count() > busy_at_start):
+                            stopped = "a request arrived"
+                            break
+                        done, w = await lane.delete_conversations(
+                            page, due[k:k + _MAX_BULK_DELETE])
+                        deleted += done
+                        why.update(w)
+            except Exception as e:
+                await _evict_dead_browser(lane, e)
+                logger.error(f"[{provider.name}] conversation cleanup failed: {e}", exc_info=True)
+                raise HTTPException(status_code=502, detail=str(e))
+    except NoFreeLane as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    gone, why = _split_already_gone(why)
+    malformed = [i for i, reason in why.items() if reason == "malformed id"]
+    LEDGER.forget(deleted + gone + malformed)
+    dropped = LEDGER.failed([i for i in why if i not in malformed])
+    for i in dropped:
+        logger.warning(f"[{provider.name}] gave up deleting {i[:8]}… after "
+                       f"{ledger.MAX_ATTEMPTS} tries: {why.get(i)}")
+    logger.info(f"[{provider.name}] cleanup: deleted {len(deleted)}/{len(due)} recorded "
+                f"conversation(s) older than {older:.0f}s"
+                + (f", {len(gone)} already gone" if gone else "")
+                + (f", {len(why)} failed" if why else "")
+                + (f"; stopped early: {stopped}" if stopped else ""))
+    return {**report, "ids": [], "deleted": deleted, "already_gone": gone,
+            "failed": list(why), "why": why, "stopped": stopped}
 
 
 def _split_already_gone(why: dict) -> tuple[list, dict]:
@@ -1996,6 +2188,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     # A guest key (an outside party) never sets its own limit: one request
     # could otherwise hold the one shared tab for an hour (second review).
     timeout = None if guest else req.timeout
+    track = _tracked(request, guest)
     if guest and QUOTA.snapshot(guest)["remaining"] <= 0:
         prompt = _WORDS_ONLY + prompt
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
@@ -2040,7 +2233,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                                                 allow_local_paths=allow_paths,
                                                 ephemeral=ephemeral,
                                                 meta=meta, variant=req.model_variant,
-                                                timeout=timeout):
+                                                timeout=timeout, track=track):
                         yield _chunk(chunk, None)
             except Exception as e:
                 # Surface the failure in-band; a raised exception here would
@@ -2073,7 +2266,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                                           allow_local_paths=allow_paths,
                                           ephemeral=ephemeral,
                                           meta=meta, variant=req.model_variant,
-                                          timeout=timeout)
+                                          timeout=timeout, track=track)
         except HTTPException:
             _record_request(provider.name, started, RuntimeError("bad request"))
             raise
@@ -2256,7 +2449,8 @@ async def _run_image_request(provider, prompt: str, specs: list, raw: Optional[l
                 text, imgs = await drive_once(lane, typed, specs, raw_uploads=raw,
                                               allow_local_paths=allow_local_paths,
                                               ephemeral=bool(guest),
-                                              meta=meta, variant=variant, kind="image")
+                                              meta=meta, variant=variant, kind="image",
+                                              track=_tracked(request, guest))
             except HTTPException:
                 _record_request(provider.name, started, RuntimeError("bad request"))
                 raise
