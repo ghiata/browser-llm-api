@@ -561,6 +561,33 @@ class Provider(ABC):
     upload_timeout: float = 90.0    # max wait for chips to appear / upload to finish
     upload_settle: float = 2.0      # extra pause once the site reports it's ready
 
+    # --- lanes (see lanes.py) ---
+    # True when a copy of this provider's signed-in profile can run as an extra
+    # browser beside the first. Only ChatGPT is verified: a copied cookie store
+    # keeps it signed in. Another provider stays at one lane until that is
+    # checked for its site.
+    supports_lanes: bool = False
+    # Which lane this instance is for. 0 is the provider's own browser and
+    # profile; an extra lane is a copy made by for_lane().
+    lane: int = 0
+
+    @property
+    def key(self) -> str:
+        """Name of this lane's browser and counters: the provider's name for
+        lane 0 (so a one-lane install reads exactly as before), name#N for the
+        others."""
+        return self.name if self.lane == 0 else f"{self.name}#{self.lane}"
+
+    def for_lane(self, lane: int) -> "Provider":
+        """A fresh instance of this provider for ``lane``. Fresh, not a copy,
+        because what a provider remembers (the model its picker shows, the
+        limits it last read) belongs to one browser."""
+        from ..lanes import lane_profile_dir
+        p = type(self)()
+        p.lane = lane
+        p.profile_dir = lane_profile_dir(self.profile_dir, lane)
+        return p
+
     def new_monitor(self) -> StreamMonitor:
         return StreamMonitor(self.stream_url_fragments, self.ws_url_fragments)
 

@@ -2,6 +2,66 @@
 
 All notable changes, newest first. Versions follow [semantic versioning](https://semver.org/): a major version can break how you install or call the project, and the notes say what to change.
 
+## Unreleased
+
+### Server
+
+- Lanes: `BROWSER_LLM_LANES=3` gives ChatGPT up to three browsers of the same account, so up to three requests run at once instead of queueing behind one. An extra browser starts only when every running one is busy, copies the signed-in session of the first (no second sign-in), runs on an X display of its own, and closes after `BROWSER_LLM_LANE_IDLE_SECONDS` idle (default 600). Images stay one at a time unless `BROWSER_LLM_IMAGE_CONCURRENCY` is raised, but a chat no longer holds one back. `/api/status` lists each lane. The default is one lane, so nothing changes until you set it. See [Configuration](docs/configuration.md#lanes).
+- Guest keys: `BROWSER_LLM_GUEST_KEYS=name:key:images` lets another person use the server with an image allowance per 24 hours. A guest reaches chat, images, the model list and a trimmed status, never the account's history, the gallery or the delete endpoints, and its conversations are deleted after each answer. Past the allowance the image endpoints answer 429 with `Retry-After`. The count survives a restart (`BROWSER_LLM_STATE_DIR`). See [Configuration](docs/configuration.md#giving-someone-else-a-key).
+- `browser-llm design` plans a set against a guest key's own allowance.
+- Account cleanup: the server writes down every conversation it makes for a tool (not the dashboard's) and `browser-llm cleanup` deletes those once they are an hour old, so the signed-in account keeps only the chats a person made there. `scripts/install-service.sh --cleanup` turns on an hourly timer for it. The cleanup never makes a request wait and never deletes saved images. Also `POST /api/conversations/cleanup`, and `keep_images` on `POST /api/conversations/delete`. See [Running it](docs/running.md#cleaning-up-the-account).
+
+### Fixed
+
+- A non-streaming chat or image request whose caller hung up while it waited for the browser is now dropped when its turn comes, instead of running to its time limit for an answer nobody reads while the queue behind it waits. The check reads the connection directly, because `request.is_disconnected()` reports every caller as connected behind the API-key middleware.
+- Deleting a dashboard chat of several turns now deletes every conversation it made in the account. The server opens a new conversation for each turn, and the dashboard kept only the last one's id, so the earlier turns stayed in the account. Chats now record each turn's conversation (`convs`); a chat from before this keeps only its last.
+- `GET /api/history` answers 429 instead of 502 when the site refuses the first page for asking too often, as one conversation's read already did, so a dashboard import reads as "try again later" rather than broken.
+- `scripts/install-service.sh` now writes a working `Documentation=` line when the checkout's path holds a space. That line is a list of addresses split on spaces, so systemd ignored it; the installer now writes each space as `%20`.
+
+## 2.1.0 — 2026-10-15
+
+A new dashboard and widget. Nothing to change when upgrading, except one widget default (below).
+
+### Dashboard
+
+- A new layout: a rail with Chat, Studio, Gallery and Server, a chat list beside the conversation (a drawer on a phone, where the rail becomes a tab bar), and an address per view. One design in both themes, with Geist shipped inside the package.
+- `Ctrl+K` palette over every chat and command, and keyboard shortcuts listed under `?`.
+- Chat: edit and resend a message, the model that answered and the time it took under each answer, a waiting state that says what is happening, Try again on a failed turn, wrap and copy on code cards, and an image viewer.
+- Studio: kinds as cards, shapes with their proportions, a frame that counts while an image is made, results kept in this browser, and buttons to download, reuse as a reference, send to a chat or reuse the brief. The site's image counter shows under Generate when the server has read it.
+- Gallery: grouped by day, loads more as you scroll, opens in the viewer with the brief and model, deletes from the viewer.
+- Server: a status headline, a chart of each provider's last 40 request times, and a widget builder with a live preview that writes the snippet.
+
+### Widget
+
+- The same design, with an animated bubble and panel, a larger size you can switch to, copy per answer, an image viewer, an unread dot and Retry on a failed turn.
+- `data-suggestions` shows starter prompts on an empty thread.
+- `BrowserLLMWidget.ask(text)` returns a Promise of the answer, `on()` and `off()` listen for `ready`, `open`, `close`, `message` and `error`, `config()` changes more settings live, and `destroy()` removes the widget.
+- The default accent is now the brand lavender in both themes; it used to be black on light pages and white on dark ones. Set `data-accent` to keep a colour of your own.
+
+### Server
+
+- `/assets` serves the UI's fonts, without a key like the pages that use them.
+- `/api/gallery` takes `offset` and answers `has_more`.
+- Images made through `/v1/images/*` keep a record beside them (`<image>.json`: brief, kind, prompt sent, model, size), returned by `/api/gallery` as `record` and deleted with the image.
+- `/api/status` lists each provider's last 40 requests as `recent`.
+
+### Client
+
+- A fallback server for chat: `BROWSER_LLM_FALLBACK_API` (with `_KEY` and `_MODEL`, default
+  `gemini-browser`). `browser-llm ask`, `client.ask()` and the MCP `ask` tool retry once there
+  when the first server is unreachable, answers 429 or 5xx, or returns nothing. Images and
+  design do not fall back. The MCP `health` tool reports the fallback server too.
+
+### Fixed
+
+- A link in an answer can no longer carry a `javascript:` address, in the dashboard or the widget. Answers are model output, and the dashboard's origin is trusted with the history and delete endpoints.
+- Narrowing the window to phone width no longer saves the chat list as hidden for the desktop.
+- The Server view no longer runs off the right edge of a phone screen.
+- A reset during an answer no longer lets the cut-off answer land in the widget's new thread.
+- Deleting a chat whose account conversation was already gone no longer reports that the server kept it: `/api/conversations/delete` lists those under `already_gone` instead of `failed`, and the dashboard says they were already gone.
+
+CI is still unavailable on the repository's account, so the checks in [Releasing](docs/releasing.md) were run by hand for this release.
+
 ## 2.0.0 — 2026-10-14
 
 A reorganized, installable package with one command, and a tighter scope.

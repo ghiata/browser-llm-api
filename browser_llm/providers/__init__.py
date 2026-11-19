@@ -17,6 +17,26 @@ from .limits import UsageLimitReached
 _INSTANCES = [ChatGPTProvider(), GeminiProvider()]
 PROVIDERS = {p.name: p for p in _INSTANCES}
 
+def _lane_count() -> int:
+    raw = os.environ.get("BROWSER_LLM_LANES", "1").strip()
+    try:
+        return max(1, min(8, int(raw)))
+    except ValueError:
+        return 1
+
+
+# Browsers per provider (BROWSER_LLM_LANES, default 1 = one request at a time).
+# LANES[name][0] is the provider in PROVIDERS; the rest are copies of its signed-in
+# profile that start on demand (see lanes.py). A provider that has not been
+# verified for lanes (supports_lanes) always has one.
+def _build_lanes(count: int) -> dict:
+    return {p.name: [p] + ([p.for_lane(i) for i in range(1, count)] if p.supports_lanes else [])
+            for p in _INSTANCES}
+
+
+LANE_COUNT = _lane_count()
+LANES = _build_lanes(LANE_COUNT)
+
 DEFAULT_PROVIDER = os.environ.get("DEFAULT_PROVIDER", "chatgpt-browser")
 if DEFAULT_PROVIDER not in PROVIDERS:
     DEFAULT_PROVIDER = _INSTANCES[0].name
@@ -37,4 +57,4 @@ def get_provider(model: str | None) -> Provider:
 
 __all__ = ["Provider", "StreamMonitor", "CompletionTracker", "RateLimited",
            "UsageLimitReached", "patch_cdp", "CHROME_ARGS", "PROVIDERS",
-           "DEFAULT_PROVIDER", "IMAGE_PROVIDERS", "get_provider"]
+           "DEFAULT_PROVIDER", "IMAGE_PROVIDERS", "LANES", "LANE_COUNT", "get_provider"]

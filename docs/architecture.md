@@ -5,7 +5,7 @@ The server is a FastAPI app that turns an OpenAI-shaped request into actions on 
 ## How a request flows
 
 1. The `model` field picks a provider (`chatgpt-browser` or `gemini-browser`).
-2. Each provider has one persistent Chrome, with its own profile, started on first use. A lock per provider serializes its requests, so ChatGPT and Gemini can run at the same time while two requests to one provider queue.
+2. Each provider has one persistent Chrome, with its own profile, started on first use, and runs one request at a time, so ChatGPT and Gemini can run at the same time while two requests to one browser queue. With `BROWSER_LLM_LANES` above 1, ChatGPT also has extra browsers (lanes), each with its own profile and X display, started from a copy of the first one's login when every running lane is busy and closed when idle. `browser_llm/lanes.py` holds the pool that picks a lane.
 3. The `messages` array is flattened into one prompt, with labelled turns, and any images are collected. Attachments are checked before anything starts, so a bad one gets a real 400.
 4. The images become temporary files. The provider opens a fresh chat, prepares the page (for ChatGPT: the model picker, the image counter, and Create image mode for an image request), uploads the files through the site's own file picker, types the prompt and sends it.
 5. A polling loop reads the answer's text, whether the site is still generating, and the state of any image. A completion tracker decides when the answer is done.

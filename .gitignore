@@ -1,6 +1,8 @@
-# Browser profiles (contain cookies, session data, etc.) — one per provider
+# Browser profiles (contain cookies, session data, etc.) — one per provider, and
+# one per extra lane (chatgpt_lane2_profile/, ...)
 gemini_profile/
 chatgpt_profile/
+*_profile/
 
 # Logs
 *.log

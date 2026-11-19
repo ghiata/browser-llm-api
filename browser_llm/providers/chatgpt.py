@@ -395,6 +395,9 @@ class ChatGPTProvider(Provider):
     name = "chatgpt-browser"
     chat_url = "https://chatgpt.com/"
     profile_dir = "./chatgpt_profile"
+    # Measured 3 Nov 2026: a copy of the cookie store in a fresh profile opens
+    # chatgpt.com signed in (composer present, no log-in button).
+    supports_lanes = True
     stream_url_fragments = ["backend-api/conversation", "/f/conversation"]
     # ChatGPT streams tokens over a WebSocket (ws.chatgpt.com), so the HTTP
     # stream-done signal never fires. We can't read completion out of the
@@ -1125,7 +1128,7 @@ class ChatGPTProvider(Provider):
         try {
           const r = await fetch('/backend-api/conversations?offset=' + offset +
                                 '&limit=' + want + '&order=updated', {headers: H});
-          if (!r.ok) { out.error = 'list HTTP ' + r.status; break; }
+          if (!r.ok) { out.error = 'list HTTP ' + r.status; out.status = r.status; break; }
           j = await r.json();
         } catch (e) { out.error = 'list failed: ' + e; break; }
         const items = j.items || [];
@@ -1241,6 +1244,8 @@ class ChatGPTProvider(Provider):
               .replace("__OFFSET__", str(max(0, int(offset)))))
         data = await self._read_json(page, js)
         if data.get("error") and not data.get("conversations"):
+            if data.get("status") == 429:
+                raise RateLimited(data["error"])
             raise RuntimeError(data["error"])
         convs = data.get("conversations") or []
         logger.info(f"[{self.name}] listed {len(convs)} conversation(s) from the account")

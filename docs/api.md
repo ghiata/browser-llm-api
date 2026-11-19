@@ -1,6 +1,6 @@
 # API
 
-The server speaks OpenAI's HTTP API at `http://localhost:8081/v1`, plus a few endpoints of its own for the dashboard. Requests from the same machine need no key. A request from another machine needs the key set in `BROWSER_LLM_API_KEY`, sent as `Authorization: Bearer <key>` or `X-Api-Key: <key>` (see [Configuration](configuration.md#who-can-call-it)).
+The server speaks OpenAI's HTTP API at `http://localhost:8081/v1`, plus a few endpoints of its own for the dashboard. Requests from the same machine need no key. A request from another machine needs the key set in `BROWSER_LLM_API_KEY`, sent as `Authorization: Bearer <key>` or `X-Api-Key: <key>` (see [Configuration](configuration.md#who-can-call-it)). A guest key (`BROWSER_LLM_GUEST_KEYS`) reaches chat, images, `/v1/models`, `/api/design/kinds` and `/api/status` only, answers 403 elsewhere, and answers 429 with `Retry-After` once its images for the last 24 hours are used.
 
 ## Choosing a provider and a model
 
@@ -34,10 +34,11 @@ Extra fields this server understands:
 | Field | Meaning |
 |---|---|
 | `model_variant` | ChatGPT model and power for this request (see above) |
+| `timeout` | seconds this request may run once it has the browser (queue time not counted) while the page still shows the model thinking with no new text; default `BROWSER_LLM_THINKING_DEADLINE`, clamped to 30 to `BROWSER_LLM_MAX_REQUEST_TIMEOUT`. An answer still streaming text may run to 900 s even when this is shorter, and a page that stopped working still gives up near 420 s (or this, when shorter). Ignored for a guest key |
 | `ephemeral` | `true` deletes the conversation from the account once the answer is read |
 | `images` | a shorthand list of image specs, attached alongside any in the messages |
 
-**Ephemeral requests.** The sessions are signed in as a person, so every call lands in that person's chat history. `"ephemeral": true` deletes the conversation as soon as the answer has been read, with the same soft delete the site's own Delete performs. A failed delete never fails the request. Without the field, `BROWSER_LLM_EPHEMERAL` decides (default off). Image requests are never deleted, because an asset usually comes with a thread worth keeping. The MCP `ask` tool sets it by default.
+**Ephemeral requests.** The sessions are signed in as a person, so every call lands in that person's chat history. `"ephemeral": true` deletes the conversation as soon as the answer has been read, with the same soft delete the site's own Delete performs. A failed delete never fails the request. Without the field, `BROWSER_LLM_EPHEMERAL` decides (default off). Image requests are not deleted straight away; the hourly cleanup removes them after an hour when it is on (see [Running it](running.md#cleaning-up-the-account)). The MCP `ask` tool sets it by default.
 
 A multi-turn `messages` array is flattened into one prompt, with labelled turns, and sent to a fresh chat. `usage` token counts are word counts, not a tokenizer's.
 
@@ -108,14 +109,15 @@ Generated images are saved under `BROWSER_LLM_IMAGE_DIR` (default `~/Pictures/br
 |---|---|
 | `GET /v1/models` | the provider ids |
 | `GET /version` | name and version |
-| `GET /api/status` | uptime, settings, and per provider: browser state, busy, telemetry, model setting, image counter |
-| `GET /api/gallery?provider=&limit=` | saved images, newest first |
+| `GET /api/status` | uptime, settings, and per provider: browser state, busy, telemetry (including `recent`, the last 40 requests as `{at, s, ok}`), model setting, image counter |
+| `GET /api/gallery?provider=&limit=&offset=` | saved images, newest first, with `total` and `has_more`; an image made through `/v1/images/*` since 2.1 carries `record` (brief, kind, prompt sent, model, size) |
 | `GET /api/design/kinds` | the design kinds with their default size and background |
-| `GET /api/history`, `GET /api/conversation/{id}` | the account's conversation list, and one conversation |
-| `POST /api/conversations/delete`, `POST /api/gallery/delete` | delete conversations from the account, and saved images from disk |
+| `GET /api/history`, `GET /api/conversation/{id}` | the account's conversation list, and one conversation; a list the site stopped part-way carries `warning`, so continue from `offset` + the count you got |
+| `POST /api/conversations/delete`, `POST /api/gallery/delete` | delete conversations from the account, and saved images from disk; `keep_images: true` deletes the conversations and keeps their images |
+| `POST /api/conversations/cleanup` | delete the conversations this server made for tools once they are `older_than` seconds old (default 3600); `dry_run: true` lists them instead; 409 while a request is in flight, or with `idle_only: false` only when no browser is free |
 | `GET /`, `/widget.js`, `/demo`, `/images/...` | the dashboard, the widget, its demo page, saved images |
 
-The four history and delete endpoints reach into a signed-in account, so they answer only callers on the server's own origin. A page on another site gets 403, even from this machine. Only ChatGPT exposes a conversation list this server can read; Gemini answers 501.
+The history, delete and cleanup endpoints reach into a signed-in account, so they answer only callers on the server's own origin. A page on another site gets 403, even from this machine. Only ChatGPT exposes a conversation list this server can read; Gemini answers 501.
 
 ## Errors
 
@@ -124,7 +126,7 @@ The four history and delete endpoints reach into a signed-in account, so they an
 | 400 | a malformed request, an unknown `kind`, or a file path from a caller that may not send one |
 | 401 | a request from another machine without the right key |
 | 403 | images are not allowed from this provider (`IMAGE_PROVIDERS`), or a cross-origin call to a history endpoint |
-| 429 | the site's usage limit; `Retry-After` and the detail give the reset time. Stop and wait. |
+| 429 | the site's usage limit; `Retry-After` and the detail give the reset time. Stop and wait. From `/api/history` or `/api/conversation/{id}`, the site is refusing reads because the account asked too often (a few hundred deletes or reads in a row can cause it for half an hour); try again later. |
 | 501 | the provider cannot do this (no image tool, no readable history) |
 | 502 | the site returned no image, or the drive failed; the detail quotes what the page said |
 

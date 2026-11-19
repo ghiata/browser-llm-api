@@ -283,6 +283,42 @@ class BatchDeleteTest(unittest.TestCase):
         self.assertEqual(page.seen, [])
 
 
+class ListRateLimitTest(unittest.TestCase):
+    """A refused first page is "try again shortly", not a broken history.
+
+    After a few hundred deletes the site answers the list call 429 for half an
+    hour; /api/history used to report that as 502, so an import looked broken.
+    """
+
+    def listing(self, reply):
+        import asyncio
+        page = BatchDeleteTest.FakePage(json.dumps(reply))
+        return asyncio.run(ChatGPTProvider().list_conversations(page, limit=50))
+
+    def test_a_refused_first_page_raises_rate_limited(self):
+        from browser_llm.providers.base import RateLimited
+        with self.assertRaises(RateLimited):
+            self.listing({"conversations": [], "has_more": False,
+                          "error": "list HTTP 429", "status": 429})
+
+    def test_another_failure_is_not_called_a_rate_limit(self):
+        from browser_llm.providers.base import RateLimited
+        with self.assertRaises(RuntimeError) as cm:
+            self.listing({"conversations": [], "has_more": False,
+                          "error": "list HTTP 500", "status": 500})
+        self.assertNotIsInstance(cm.exception, RateLimited)
+
+    def test_a_refusal_after_some_pages_keeps_them(self):
+        conv = {"id": "6c1f0f2e-9b3a-4f6d-8a21-0b7c5d9e1234", "title": "t"}
+        data = self.listing({"conversations": [conv], "has_more": True,
+                             "error": "list HTTP 429", "status": 429})
+        self.assertEqual(data["conversations"], [conv])
+        self.assertEqual(data["warning"], "list HTTP 429")
+
+    def test_the_page_script_reports_the_status(self):
+        self.assertIn("out.status = r.status", ChatGPTProvider._LIST_JS)
+
+
 class BulkLimitTest(unittest.TestCase):
     def test_the_cap_is_smaller_than_a_whole_account(self):
         # A slip in the dashboard should not turn into 2000 site calls.
@@ -292,3 +328,15 @@ class BulkLimitTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AlreadyGoneTest(unittest.TestCase):
+    """A 404 on delete means the thread is already off the account."""
+
+    def test_404s_leave_the_failures(self):
+        gone, why = server._split_already_gone({"a": "HTTP 404", "b": "HTTP 429", "c": "TypeError: Failed to fetch"})
+        self.assertEqual(gone, ["a"])
+        self.assertEqual(why, {"b": "HTTP 429", "c": "TypeError: Failed to fetch"})
+
+    def test_nothing_gone_when_nothing_failed(self):
+        self.assertEqual(server._split_already_gone({}), ([], {}))

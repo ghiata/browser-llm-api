@@ -43,6 +43,7 @@ Example provider entry for an OpenAI-compatible client:
 import asyncio
 import base64
 import json
+import math
 import os
 import re
 import shutil
@@ -50,6 +51,7 @@ import tempfile
 import time
 import uuid
 import logging
+from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncGenerator, Optional, Union
@@ -68,11 +70,11 @@ except ImportError:  # without it, urllib does the download
     httpx = None
 
 from .providers import (
-    PROVIDERS, DEFAULT_PROVIDER, IMAGE_PROVIDERS, get_provider, patch_cdp, CHROME_ARGS,
+    PROVIDERS, LANES, DEFAULT_PROVIDER, IMAGE_PROVIDERS, get_provider, patch_cdp, CHROME_ARGS,
     CompletionTracker, RateLimited, UsageLimitReached,
 )
 from .providers.limits import refusal_from_message
-from . import authz, config, design
+from . import authz, config, design, guests, lanes, ledger
 from ._version import __version__
 
 # ---------------------------------------------------------------------------
@@ -316,6 +318,16 @@ async def _attachment_files(specs: Optional[list], raw: Optional[list] = None, *
 # a second machine calls this one's API directly, with the key.
 # ---------------------------------------------------------------------------
 API_KEY = os.environ.get("BROWSER_LLM_API_KEY", "").strip()
+# Other people's keys, each with an image allowance per 24 hours (guests.py).
+GUESTS = guests.parse_guest_keys(os.environ.get("BROWSER_LLM_GUEST_KEYS"), API_KEY)
+QUOTA = guests.ImageQuota(guests.default_state_dir() / "guest-images.json")
+# Conversations this server made on the account, for the hourly cleanup
+# (ledger.py, POST /api/conversations/cleanup).
+LEDGER = ledger.ConversationLedger(guests.default_state_dir() / "conversations.json")
+if GUESTS:
+    logging.getLogger("gemini_server").info(
+        "guest keys: " + ", ".join(f"{g.name} ({g.images_per_day} images per 24 h)"
+                                   for g in GUESTS.values()))
 if os.environ.get("REMOTE_PROVIDERS", "").strip():
     logging.getLogger("gemini_server").warning(
         "REMOTE_PROVIDERS is set but forwarding to another install was removed in 2.0; "
@@ -372,13 +384,32 @@ class ChatCompletionRequest(BaseModel):
     # this request, e.g. "instant", "GPT-6/medium" (ChatGPT; see
     # providers/chatgpt.py parse_variant). Unset = CHATGPT_MODEL/CHATGPT_EFFORT.
     model_variant: Optional[str] = None
+    # Not OpenAI: the most seconds this request may run once it has the
+    # browser (queue time not counted) while the page still shows the model
+    # thinking or answering. Unset = BROWSER_LLM_THINKING_DEADLINE (1500 s);
+    # clamped to 30..BROWSER_LLM_MAX_REQUEST_TIMEOUT (3600 s). A page that
+    # stopped working still gives up near 420 s.
+    timeout: Optional[float] = None
 
 
 class ConversationDeleteRequest(BaseModel):
     """Delete these conversations from the provider's account. Destructive on
-    someone's real history, hence the same-origin gate on the endpoint."""
+    someone's real history, hence the same-origin gate on the endpoint.
+    ``keep_images`` leaves the saved image files of those conversations alone
+    (a clean-up of the account, not of the gallery)."""
     model: Optional[str] = None
     ids: list[str] = []
+    keep_images: bool = False
+
+
+class ConversationCleanupRequest(BaseModel):
+    """Delete the conversations this server made and wrote in its ledger once
+    they are ``older_than`` seconds old. ``idle_only`` runs only while nothing
+    is in flight on the provider; ``dry_run`` reports what would go."""
+    model: Optional[str] = None
+    older_than: float = 3600
+    dry_run: bool = False
+    idle_only: bool = True
 
 
 class GalleryDeleteRequest(BaseModel):
@@ -439,11 +470,30 @@ def _design_prompt(prompt: str, fields: dict, n_refs: int, size: Optional[str],
     return text, size or d["size"], background or d["background"]
 
 # ---------------------------------------------------------------------------
-# Browser state — one persistent instance per provider, one request at a time
-# per provider (so Gemini and ChatGPT can run concurrently).
+# Browser state — a provider has one or more lanes (browser_llm/lanes.py), each
+# its own Chrome running one request at a time. Lane 0 is the provider's own
+# browser; with BROWSER_LLM_LANES above 1 the others start on demand from a copy
+# of its login and close when idle. Gemini and ChatGPT always run concurrently.
+# _browsers and _img_gen_count are keyed by Provider.key: the provider's name
+# for lane 0, name#N for the others.
 # ---------------------------------------------------------------------------
 _browsers: dict[str, uc.Browser] = {}
-_locks: dict[str, asyncio.Lock] = {name: asyncio.Lock() for name in PROVIDERS}
+_pools: dict[str, lanes.LanePool] = {name: lanes.LanePool(len(LANES[name])) for name in PROVIDERS}
+_displays: dict[str, lanes.PrivateDisplay] = {}   # an extra lane's own Xvfb
+_lane_start_lock = asyncio.Lock()   # one extra Chrome starts at a time (it borrows DISPLAY)
+
+# An extra lane's browser closes after this many idle seconds, freeing about 2 GB.
+_LANE_IDLE_SECONDS = float(os.environ.get("BROWSER_LLM_LANE_IDLE_SECONDS", "600"))
+# A lane that failed to start or is signed out is left alone this long.
+_LANE_RETRY_SECONDS = 300.0
+
+# Image requests allowed at once per provider, across lanes. ChatGPT limits how
+# fast images are made ("You're generating images too quickly"), and how many it
+# allows at once has not been measured, so the default is one: images still wait
+# for each other, but no longer for chat answers.
+_IMAGE_CONCURRENCY = max(1, int(os.environ.get("BROWSER_LLM_IMAGE_CONCURRENCY", "1") or 1))
+_image_gates: dict[str, asyncio.Semaphore] = {
+    name: asyncio.Semaphore(_IMAGE_CONCURRENCY) for name in PROVIDERS}
 
 # Recycle a provider's browser once it has done this many image gens. On the
 # free plan the renderer bloated after 4-5 slow image generations and started
@@ -470,12 +520,13 @@ _img_gen_count: dict[str, int] = {name: 0 for name in PROVIDERS}
 
 
 def _note_image_gen(provider) -> None:
-    _img_gen_count[provider.name] = _img_gen_count.get(provider.name, 0) + 1
+    _img_gen_count[provider.key] = _img_gen_count.get(provider.key, 0) + 1
 
 
 # Lightweight per-provider telemetry for the dashboard's live status panel.
 # In-memory only (reset on restart). Latency is wall-clock for the actual browser
 # drive (queue-wait excluded), so it reflects model/site speed, not our overhead.
+_RECENT_KEPT = 40
 _metrics: dict[str, dict] = {
     name: {
         "requests": 0,           # completed requests (chat + image)
@@ -485,6 +536,8 @@ _metrics: dict[str, dict] = {
         "last_error": None,      # most recent error text (truncated)
         "last_error_at": None,   # epoch seconds
         "last_request_at": None,  # epoch seconds
+        # the last requests, oldest first: {"at", "s", "ok"}, for the latency chart
+        "recent": deque(maxlen=_RECENT_KEPT),
     }
     for name in PROVIDERS
 }
@@ -505,6 +558,7 @@ def _record_request(name: str, started: float, error: Optional[BaseException] = 
     m["total_latency"] += dur
     m["last_latency"] = round(dur, 2)
     m["last_request_at"] = int(time.time())
+    m["recent"].append({"at": int(time.time()), "s": round(dur, 2), "ok": error is None})
     if error is not None:
         m["errors"] += 1
         m["last_error"] = str(error)[:200]
@@ -529,21 +583,76 @@ async def _browser_alive(b: uc.Browser) -> bool:
         return False
 
 
-async def get_browser(provider) -> uc.Browser:
-    b = _browsers.get(provider.name)
+def _lane_label(provider) -> str:
+    """How a lane reads in the log: the provider's name, plus the lane's number
+    (counted from 1) when the provider has more than one."""
+    return provider.name if len(LANES[provider.name]) == 1 else f"{provider.name} lane {provider.lane + 1}"
 
-    # Proactively recycle a browser that has generated enough images to bloat.
-    # Called at the start of each (per-provider serialized) request, so the
-    # browser is never recycled mid-response.
-    if b is not None and _img_gen_count.get(provider.name, 0) >= _RECYCLE_AFTER_IMAGES:
-        logger.info(f"[{provider.name}] recycling browser after "
-                    f"{_img_gen_count[provider.name]} image gens")
+
+def _stop_browser(provider, b: Optional[uc.Browser]) -> None:
+    """Stop a lane's Chrome and forget everything that belonged to it: its
+    cached handle, its image count, its warm flag in the pool and, for an extra
+    lane, the private display it ran on."""
+    if b is not None:
         try:
             b.stop()
         except Exception as e:
-            logger.warning(f"[{provider.name}] browser stop during recycle failed: {e}")
-        _browsers.pop(provider.name, None)
-        _img_gen_count[provider.name] = 0
+            logger.warning(f"[{_lane_label(provider)}] browser stop failed: {e}")
+    key = provider.key
+    _browsers.pop(key, None)
+    _verified_lanes.discard(key)
+    _img_gen_count[key] = 0  # the count tracked THAT browser's bloat, not the next one's
+    _pools[provider.name].set_warm(provider.lane, False)
+    display = _displays.pop(key, None)
+    if display is not None:
+        display.stop()
+
+
+async def _launch_browser(provider) -> uc.Browser:
+    """Start a lane's Chrome. Lane 0 uses the service's own display. An extra
+    lane first copies lane 0's login, then gets an Xvfb of its own, because a
+    window another lane's window covers reads as hidden to the site."""
+    if provider.lane == 0:
+        return await uc.start(user_data_dir=provider.profile_dir,
+                              browser_args=list(CHROME_ARGS))
+    async with _lane_start_lock:
+        main = PROVIDERS[provider.name]
+        n = await asyncio.to_thread(lanes.clone_login, main.profile_dir, provider.profile_dir)
+        logger.info(f"[{_lane_label(provider)}] login copied from lane 1 ({n} cookies)")
+        display = lanes.PrivateDisplay()
+        await asyncio.to_thread(display.start)
+        # nodriver starts Chrome with the server's own environment, so DISPLAY
+        # is swapped for the moment Chrome starts. One lane starts at a time.
+        saved = {k: os.environ.get(k) for k in display.env}
+        os.environ.update(display.env)
+        try:
+            b = await uc.start(user_data_dir=provider.profile_dir,
+                               browser_args=list(CHROME_ARGS))
+        except BaseException:
+            await asyncio.to_thread(display.stop)
+            raise
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        _displays[provider.key] = display
+        return b
+
+
+async def get_browser(provider) -> uc.Browser:
+    """The lane's Chrome, started if there is none. Called at the start of each
+    request, once its lane is taken, so a browser is never recycled or replaced
+    under a request that is using it."""
+    key = provider.key
+    b = _browsers.get(key)
+
+    # Proactively recycle a browser that has generated enough images to bloat.
+    if b is not None and _img_gen_count.get(key, 0) >= _RECYCLE_AFTER_IMAGES:
+        logger.info(f"[{_lane_label(provider)}] recycling browser after "
+                    f"{_img_gen_count[key]} image gens")
+        _stop_browser(provider, b)
         b = None
         await asyncio.sleep(2)  # let Chrome release the profile before restart
 
@@ -551,14 +660,9 @@ async def get_browser(provider) -> uc.Browser:
     # replace it now so THIS request succeeds, instead of failing it once
     # and only recovering on the next one.
     if b is not None and not await _browser_alive(b):
-        logger.warning(f"[{provider.name}] cached browser is dead (process or CDP "
+        logger.warning(f"[{_lane_label(provider)}] cached browser is dead (process or CDP "
                        f"connection); starting a fresh one")
-        try:
-            b.stop()
-        except Exception:
-            pass
-        _browsers.pop(provider.name, None)
-        _img_gen_count[provider.name] = 0
+        _stop_browser(provider, b)
         b = None
         await asyncio.sleep(2)  # let Chrome release the profile before restart
 
@@ -569,9 +673,10 @@ async def get_browser(provider) -> uc.Browser:
                 f.unlink()
         except Exception:
             pass
-        logger.info(f"[{provider.name}] Starting browser (profile {provider.profile_dir})...")
-        b = await uc.start(user_data_dir=provider.profile_dir, browser_args=list(CHROME_ARGS))
-        _browsers[provider.name] = b
+        logger.info(f"[{_lane_label(provider)}] Starting browser (profile {provider.profile_dir})...")
+        b = await _launch_browser(provider)
+        _browsers[key] = b
+        _pools[provider.name].set_warm(provider.lane, True)
     return b
 
 
@@ -596,15 +701,105 @@ async def _evict_dead_browser(provider, exc: BaseException) -> None:
     *next* request starts a fresh one instead of retrying against a corpse."""
     if not _is_dead_transport(exc):
         return
-    b = _browsers.pop(provider.name, None)
-    _img_gen_count[provider.name] = 0  # count tracked THAT browser's bloat, not the next one's
+    b = _browsers.get(provider.key)
     if b is not None:
-        logger.warning(f"[{provider.name}] browser connection died ({exc!r}); "
+        logger.warning(f"[{_lane_label(provider)}] browser connection died ({exc!r}); "
                        f"evicting so the next request starts fresh")
+    _stop_browser(provider, b)
+
+
+# ---------------------------------------------------------------------------
+# Taking a lane for one request
+# ---------------------------------------------------------------------------
+_verified_lanes: set[str] = set()   # extra lanes whose login the site accepted
+
+
+async def _verify_lane_login(provider, browser) -> None:
+    """An extra lane starts from a copy of lane 0's cookies. Make sure the site
+    took them before a request is given the lane: a signed-out lane would
+    otherwise fail that request with "nothing happened on the page"."""
+    deadline = time.monotonic() + 40
+    async with provider.session_tab(browser) as page:
+        while not await provider.logged_in(page):
+            if time.monotonic() > deadline:
+                raise lanes.LaneUnavailable("the site did not accept the copied login")
+            await asyncio.sleep(2)
+
+
+async def _ready_extra_lane(provider) -> None:
+    await get_browser(provider)
+    key = provider.key
+    if key not in _verified_lanes:
+        await _verify_lane_login(provider, _browsers[key])
+        _verified_lanes.add(key)
+
+
+class NoFreeLane(RuntimeError):
+    """Every lane is busy or a request is waiting, and the caller asked not to
+    wait (``_lane(..., wait=False)``)."""
+
+
+@asynccontextmanager
+async def _lane(provider, *, cold_ok: bool = True, wait: bool = True):
+    """Take one of the provider's lanes for one request and yield that lane's
+    Provider, which the request must use in place of ``provider``.
+
+    Takes a free lane whose browser runs; else starts an extra lane (so a
+    request waits only when every lane is busy). An extra lane that cannot start
+    or is signed out is left alone for _LANE_RETRY_SECONDS and the request takes
+    another lane. ``cold_ok=False`` is for work not worth starting a Chrome for.
+    ``wait=False`` raises NoFreeLane instead of queueing, for background work
+    that must never hold up a request.
+    """
+    pool = _pools[provider.name]
+    while True:
+        if wait:
+            i = await pool.acquire(cold_ok=cold_ok)
+        else:
+            i = pool.try_acquire(cold_ok=cold_ok)
+            if i is None:
+                raise NoFreeLane(f"every {provider.name} lane is busy or has a request waiting")
+        lp = LANES[provider.name][i]
+        if i == 0:
+            break
         try:
-            b.stop()
-        except Exception:
-            pass
+            await _ready_extra_lane(lp)
+            break
+        except asyncio.CancelledError:
+            _stop_browser(lp, _browsers.get(lp.key))
+            pool.release(i, served=False)
+            raise
+        except Exception as e:
+            logger.warning(f"[{_lane_label(lp)}] unavailable for {_LANE_RETRY_SECONDS:.0f}s: {e}")
+            _stop_browser(lp, _browsers.get(lp.key))
+            pool.release(i, down_for=_LANE_RETRY_SECONDS, served=False)
+    try:
+        yield lp
+    finally:
+        pool.release(i)
+
+
+async def _reap_idle_lanes() -> None:
+    """Stop the browser of every extra lane that has been idle too long."""
+    for name, pool in _pools.items():
+        for i in pool.idle_extras(_LANE_IDLE_SECONDS):
+            if not pool.claim(i):
+                continue
+            lp = LANES[name][i]
+            try:
+                logger.info(f"[{_lane_label(lp)}] idle for {_LANE_IDLE_SECONDS:.0f}s; closing its browser")
+                _stop_browser(lp, _browsers.get(lp.key))
+            finally:
+                pool.release(i, served=False)
+
+
+async def _reap_loop() -> None:
+    while True:
+        await asyncio.sleep(30)
+        try:
+            await _reap_idle_lanes()
+        except Exception as e:
+            logger.warning(f"idle-lane check failed: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -656,6 +851,48 @@ def _persist(im: dict, provider, conv_id: Optional[str] = None) -> dict:
     except Exception as e:
         logger.warning(f"failed to save image: {e}")
     return im
+
+
+def _sidecar(path: Path) -> Path:
+    """Where the record of what made a saved image lives: next to it, same name
+    plus .json. The gallery reads it; deleting the image deletes it too."""
+    return path.with_name(path.name + ".json")
+
+
+def _write_record(imgs: list[dict], record: dict) -> None:
+    """Keep the brief, the words sent and who drew it beside each saved image,
+    so the gallery can show them later. A failure here never fails the image."""
+    for im in imgs:
+        if not im.get("path"):
+            continue
+        try:
+            entry = dict(record, created=int(time.time()))
+            if im.get("b64"):
+                wh = _pixel_size(base64.b64decode(im["b64"]))
+                if wh:
+                    entry["width"], entry["height"] = wh
+            _sidecar(Path(im["path"])).write_text(json.dumps(entry, ensure_ascii=False))
+        except Exception as e:
+            logger.warning(f"could not write the image record: {e}")
+
+
+def _read_record(path: Path) -> Optional[dict]:
+    try:
+        return json.loads(_sidecar(path).read_text())
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+
+
+def _unlink_saved(path: Path) -> None:
+    """Delete a saved image and its record. Raises FileNotFoundError if the
+    image is already gone, as Path.unlink does."""
+    path.unlink()
+    try:
+        _sidecar(path).unlink(missing_ok=True)
+    except Exception as e:
+        logger.warning(f"could not delete the record of {path.name}: {e}")
 
 
 def _img_markdown(im: dict) -> str:
@@ -778,9 +1015,56 @@ def _build_prompt(messages: list[Message]) -> tuple[str, list[str]]:
 
 _BASE_DEADLINE = 420.0   # base ceiling; long image gen on the free tier is slow
 _MAX_DEADLINE = 900.0    # hard cap even for an answer that keeps actively streaming
+# GPT-6 at High can think for over seven minutes with no answer text growing and
+# no WebSocket frames while the page still shows it working (Stop button, turn
+# in_progress). Such a request may wait up to this cap; a page that stopped
+# working still gives up near _BASE_DEADLINE.
+_THINKING_DEADLINE = max(_MAX_DEADLINE,
+                         float(os.environ.get("BROWSER_LLM_THINKING_DEADLINE", "1500")))
+# The most a request's own ``timeout`` may ask for, and the least (a smaller
+# value is raised to this so a typo cannot cut every answer short).
+_REQUEST_TIMEOUT_MAX = max(_THINKING_DEADLINE,
+                           float(os.environ.get("BROWSER_LLM_MAX_REQUEST_TIMEOUT", "3600")))
+_REQUEST_TIMEOUT_MIN = 30.0
 
 
-async def _stream_completion(provider, page, monitor) -> AsyncGenerator[str, None]:
+def _request_caps(timeout: Optional[float] = None) -> tuple[float, float, float]:
+    """(base, streaming cap, thinking cap) in seconds for one request.
+
+    Unset ``timeout`` keeps the server's defaults. A caller's ``timeout``
+    (clamped to ``_REQUEST_TIMEOUT_MIN``..``_REQUEST_TIMEOUT_MAX``) becomes the
+    cap for a silent thinking phase and may lower the base; an answer whose
+    text is still arriving keeps the streaming cap, so a short ``timeout`` never
+    cuts a long answer mid-stream (second review, EBE-7813)."""
+    if timeout is None or not math.isfinite(float(timeout)):
+        return _BASE_DEADLINE, _MAX_DEADLINE, _THINKING_DEADLINE
+    t = min(max(float(timeout), _REQUEST_TIMEOUT_MIN), _REQUEST_TIMEOUT_MAX)
+    return min(_BASE_DEADLINE, t), _MAX_DEADLINE, t
+
+
+def _extended_deadline(start, deadline, *, streaming, generating,
+                       stream_cap=None, think_cap=None):
+    """The new deadline when the current one is reached, or None to give up.
+
+    Extends in 120 s steps while the answer is still in flight: text or frames
+    still arriving (up to ``stream_cap``, default ``_MAX_DEADLINE``, or the
+    thinking cap when that is longer and the page is generating), or the page
+    silent but still showing that it is generating (up to ``think_cap``,
+    default ``_THINKING_DEADLINE``)."""
+    stream_cap = _MAX_DEADLINE if stream_cap is None else stream_cap
+    think_cap = _THINKING_DEADLINE if think_cap is None else think_cap
+    if streaming:
+        cap = start + (max(think_cap, stream_cap) if generating else stream_cap)
+    else:
+        cap = start + think_cap
+    if (streaming or generating) and deadline < cap:
+        return min(cap, deadline + 120.0)
+    return None
+
+
+async def _stream_completion(provider, page, monitor,
+                             timeout: Optional[float] = None,
+                             on_conversation=None) -> AsyncGenerator[str, None]:
     """
     Poll the response, yielding text deltas as they grow; return when complete.
 
@@ -788,11 +1072,27 @@ async def _stream_completion(provider, page, monitor) -> AsyncGenerator[str, Non
     loop only polls the page, feeds samples in, and yields chunks. Long answers
     (e.g. a whole HTML page) that are *still actively streaming* extend the
     deadline up to ``_MAX_DEADLINE`` so they aren't truncated mid-generation,
-    while a stalled request still gives up near ``_BASE_DEADLINE``.
+    and a long silent thinking phase extends it up to ``_THINKING_DEADLINE``,
+    while a stalled request still gives up near ``_BASE_DEADLINE``. A request's
+    own ``timeout`` replaces the thinking cap and bounds the rest (see
+    ``_request_caps``).
+
+    ``on_conversation(id)`` is called once, as soon as the page shows which
+    conversation the site made for this drive. That is early on purpose: a
+    request that later times out, fails or loses its caller still leaves the
+    conversation on the account, and the cleanup can only delete what was
+    written down.
     """
     tracker = CompletionTracker()
+    conv_seen = on_conversation is None
+    conv_next_try = 0.0
     start = time.monotonic()
-    deadline = start + _BASE_DEADLINE
+    base, stream_cap, think_cap = _request_caps(timeout)
+    if timeout is not None:
+        logger.info(f"[{provider.name}] request timeout {think_cap:.0f}s "
+                    f"(asked {float(timeout):.0f}s)")
+    deadline = start + base
+    generating = False
     # Some providers' extracted text reshapes near the end (see
     # Provider.buffered_stream); for those we suppress incremental deltas and
     # emit the final authoritative text once, so append-only SSE stays correct.
@@ -802,12 +1102,19 @@ async def _stream_completion(provider, page, monitor) -> AsyncGenerator[str, Non
         now = time.monotonic()
         if now >= deadline:
             # Extend only while the answer is plainly still in flight — text
-            # still growing, or WebSocket frames still arriving (ChatGPT).
+            # still growing, WebSocket frames still arriving (ChatGPT), or the
+            # page still showing it is generating (a long thinking phase).
             ws_idle = monitor.seconds_since_ws_frame(now)
-            active = (tracker.silent_for(now) < 5.0
-                      or (ws_idle is not None and ws_idle < CompletionTracker.WS_ACTIVE_WINDOW))
-            if active and deadline < start + _MAX_DEADLINE:
-                deadline = min(start + _MAX_DEADLINE, deadline + 120.0)
+            streaming = (tracker.silent_for(now) < 5.0
+                         or (ws_idle is not None and ws_idle < CompletionTracker.WS_ACTIVE_WINDOW))
+            extended = _extended_deadline(start, deadline, streaming=streaming,
+                                          generating=generating,
+                                          stream_cap=stream_cap, think_cap=think_cap)
+            if extended is not None:
+                if generating and not streaming:
+                    logger.info(f"[{provider.name}] still generating at {now - start:.0f}s "
+                                f"with no new text; waiting (cap {think_cap:.0f}s)")
+                deadline = extended
             else:
                 logger.warning(
                     f"[{provider.name}] completion deadline reached "
@@ -823,9 +1130,21 @@ async def _stream_completion(provider, page, monitor) -> AsyncGenerator[str, Non
         raw = await provider.get_response_text(page)
         img = await provider.image_status(page)
         is_gen = await provider.is_generating(page)
+        generating = bool(is_gen)
         cdp_done = monitor.stream_done.is_set()
         # Only needed until the answer shows any sign of life (see "nostart").
         submitted = None if tracker.started else await provider.has_user_turn(page)
+        if not conv_seen and (tracker.started or submitted) and now >= conv_next_try:
+            # The site puts the id in the URL once it has made the
+            # conversation, shortly after our turn appears.
+            conv_next_try = now + 2.0
+            conv_id = await _read_conversation_id(provider, page)
+            if conv_id:
+                conv_seen = True
+                try:
+                    on_conversation(conv_id)
+                except Exception as e:
+                    logger.warning(f"[{provider.name}] could not record conversation: {e}")
 
         chunk, done = tracker.feed(now, raw, is_gen, img, cdp_done=cdp_done,
                                    submitted=submitted)
@@ -868,14 +1187,16 @@ def _ephemeral(req: "ChatCompletionRequest") -> bool:
     return _EPHEMERAL_DEFAULT if req.ephemeral is None else bool(req.ephemeral)
 
 
-async def _discard(provider, page) -> None:
-    """Delete the conversation an ephemeral request just created. Never raises:
-    the answer has already been read, and losing the cleanup is a tidier failure
-    than losing the response."""
+async def _discard(provider, page) -> bool:
+    """Delete the conversation an ephemeral request just created; True when the
+    site took the delete. Never raises: the answer has already been read, and
+    losing the cleanup is a tidier failure than losing the response. A failed
+    delete stays in the ledger, so the hourly cleanup tries again."""
     try:
-        await provider.discard_conversation(page)
+        return bool(await provider.discard_conversation(page))
     except Exception as e:
         logger.warning(f"[{provider.name}] discard_conversation failed: {e}")
+        return False
 
 
 async def _read_conversation_id(provider, page) -> str:
@@ -894,6 +1215,39 @@ def _note_conversation(meta: Optional[dict], conv_id: str) -> None:
     a cascade, not the answer."""
     if meta is not None and conv_id:
         meta["conversation_id"] = conv_id
+
+
+# Conversations a drive is still working in. The cleanup never deletes one of
+# these, whatever its age: a request may run 25 minutes.
+_live_conversations: set[str] = set()
+
+
+class _ConversationWatch:
+    """What one drive does with the conversation the site made for it: write it
+    in the ledger so the hourly cleanup can delete it (unless ``track`` is
+    False: a person's chat from the dashboard), mark it in use until the drive
+    ends, and take it off the ledger once an ephemeral request has deleted it."""
+
+    def __init__(self, provider, kind: str, track: bool):
+        self.provider = provider
+        self.kind = kind
+        self.track = track
+        self.id = ""
+
+    def seen(self, conv_id: str) -> None:
+        if self.id or not conv_id:
+            return
+        self.id = conv_id
+        _live_conversations.add(conv_id)
+        if self.track:
+            LEDGER.note(conv_id, provider=self.provider.name, kind=self.kind)
+
+    def deleted(self) -> None:
+        if self.id:
+            LEDGER.forget([self.id])
+
+    def close(self) -> None:
+        _live_conversations.discard(self.id)
 
 
 async def _read_model_used(provider, page, monitor, options: dict) -> dict:
@@ -938,14 +1292,18 @@ async def run_chat(provider, prompt: str, attachments: Optional[list] = None, *,
                    allow_local_paths: bool = True,
                    ephemeral: bool = False,
                    meta: Optional[dict] = None,
-                   variant: Optional[str] = None) -> AsyncGenerator[str, None]:
+                   variant: Optional[str] = None,
+                   timeout: Optional[float] = None,
+                   track: bool = True) -> AsyncGenerator[str, None]:
     """Open the provider's chat, attach any input images, send the prompt, stream
     text deltas, then append any generated images as markdown links.
 
     ``ephemeral`` deletes the conversation from the account once the answer has
     been read, for callers whose prompts are tooling rather than conversation.
-    ``variant`` is the request's model_variant (see Provider.prepare_page)."""
+    ``variant`` is the request's model_variant (see Provider.prepare_page).
+    ``track`` writes the conversation in the ledger for the hourly cleanup."""
     browser = await get_browser(provider)
+    watch = _ConversationWatch(provider, "chat", track)
     try:
         async with _attachment_files(attachments, raw_uploads,
                                      allow_local_paths=allow_local_paths) as files:
@@ -953,29 +1311,36 @@ async def run_chat(provider, prompt: str, attachments: Optional[list] = None, *,
             page, monitor = await provider.open_and_send(browser, prompt, attachments=files,
                                                          options=options)
 
-            async for delta in _stream_completion(provider, page, monitor):
+            async for delta in _stream_completion(provider, page, monitor, timeout=timeout,
+                                                  on_conversation=watch.seen):
                 yield delta
 
             used = await _read_model_used(provider, page, monitor, options)
             if meta is not None and used:
                 meta["model_used"] = used
             # Before the images, not after: the id becomes part of their names.
-            conv_id = "" if ephemeral else await _read_conversation_id(provider, page)
+            conv_id = await _read_conversation_id(provider, page)
+            watch.seen(conv_id)
             n = 0
             for im in await provider.get_images(page):
-                _persist(im, provider, conv_id)
+                _persist(im, provider, "" if ephemeral else conv_id)
                 n += 1
+                if meta is not None:
+                    meta.setdefault("images", []).append(Path(im.get("path") or "").name)
                 logger.info(f"[{provider.name}] attaching image ({im.get('mime')})")
                 yield _img_markdown(im)
             if n:
                 _note_image_gen(provider)  # count toward browser recycle
             if ephemeral:
-                await _discard(provider, page)
+                if await _discard(provider, page):
+                    watch.deleted()
             else:
                 _note_conversation(meta, conv_id)
     except Exception as e:
         await _evict_dead_browser(provider, e)
         raise
+    finally:
+        watch.close()
 
     # Leave the tab open — closing or navigating away disrupts the browser.
 
@@ -986,11 +1351,15 @@ async def drive_once(provider, prompt: str, attachments: Optional[list] = None, 
                      ephemeral: bool = False,
                      meta: Optional[dict] = None,
                      variant: Optional[str] = None,
-                     kind: str = "chat") -> tuple[str, list[dict]]:
+                     kind: str = "chat",
+                     timeout: Optional[float] = None,
+                     track: bool = True) -> tuple[str, list[dict]]:
     """Non-streaming drive used by non-streaming chat and the images endpoints:
     returns (text, images). ``kind`` "image" makes the provider read the
-    site's own image counter first (see Provider.prepare_page)."""
+    site's own image counter first (see Provider.prepare_page). ``track`` as
+    in run_chat."""
     browser = await get_browser(provider)
+    watch = _ConversationWatch(provider, kind, track)
     try:
         async with _attachment_files(attachments, raw_uploads,
                                      allow_local_paths=allow_local_paths) as files:
@@ -1000,24 +1369,35 @@ async def drive_once(provider, prompt: str, attachments: Optional[list] = None, 
             if meta is not None and "image_tool" in options:
                 meta["image_tool"] = options["image_tool"]
             text = ""
-            async for delta in _stream_completion(provider, page, monitor):
+            if timeout is None and kind == "image":
+                # An image request keeps the caps it had before the long
+                # thinking wait (a silent page gives up near 420 s, a streaming
+                # one by 900 s): a stuck image must not hold the browser 25 min,
+                # and its clients wait 440 s.
+                timeout = _BASE_DEADLINE
+            async for delta in _stream_completion(provider, page, monitor, timeout=timeout,
+                                                  on_conversation=watch.seen):
                 text += delta
             used = await _read_model_used(provider, page, monitor, options)
             if meta is not None and used:
                 meta["model_used"] = used
-            conv_id = "" if ephemeral else await _read_conversation_id(provider, page)
-            imgs = [_persist(im, provider, conv_id)
+            conv_id = await _read_conversation_id(provider, page)
+            watch.seen(conv_id)
+            imgs = [_persist(im, provider, "" if ephemeral else conv_id)
                     for im in await provider.get_images(page)]
             if imgs:
                 _note_image_gen(provider)  # count toward browser recycle
             if ephemeral:
-                await _discard(provider, page)
+                if await _discard(provider, page):
+                    watch.deleted()
             else:
                 _note_conversation(meta, conv_id)
             return text, imgs
     except Exception as e:
         await _evict_dead_browser(provider, e)
         raise
+    finally:
+        watch.close()
 
 
 def _prevalidate_specs(specs: list, *, allow_local_paths: bool) -> None:
@@ -1061,13 +1441,18 @@ async def lifespan(app: FastAPI):
     # instance that must not open Chrome over the service's windows.
     if _PREWARM:
         await get_browser(get_provider(DEFAULT_PROVIDER))
+    reaper = asyncio.create_task(_reap_loop()) if any(p.size > 1 for p in _pools.values()) else None
+    if reaper:
+        logger.info("Lanes: " + ", ".join(f"{n} x{p.size}" for n, p in _pools.items() if p.size > 1)
+                    + f" (extra lanes close after {_LANE_IDLE_SECONDS:.0f}s idle)")
     logger.info("Server ready.")
     yield
-    for b in _browsers.values():
-        try:
-            b.stop()
-        except Exception:
-            pass
+    if reaper:
+        reaper.cancel()
+    for group in LANES.values():
+        for lp in group:
+            if lp.key in _browsers or lp.key in _displays:
+                _stop_browser(lp, _browsers.get(lp.key))
 
 
 app = FastAPI(title="Browser LLM API", version=__version__, lifespan=lifespan)
@@ -1091,11 +1476,26 @@ async def _require_api_key(request: Request, call_next):
     Registered after CORSMiddleware → runs before it, so OPTIONS preflights
     (which can't carry auth headers) are exempted in needs_key."""
     client = request.client.host if request.client else None
-    if (API_KEY and not authz.is_loopback(client)
+    supplied = authz.extract_key(request.headers.get("authorization"),
+                                 request.headers.get("x-api-key"))
+    # A guest's key makes the request the guest's from ANY address, loopback
+    # included, so a guest can't step around the limits from this machine and
+    # the limits can be tried locally.
+    guest = _guest_for(supplied)
+    request.state.guest = guest
+    if guest is not None:
+        if not authz.guest_may(request.url.path, request.method):
+            logger.warning(f"guest {guest.name} refused {request.method} {request.url.path}")
+            return JSONResponse(
+                {"error": {"message": "this key may use chat, images, the model list and "
+                           "the status only", "type": "invalid_request_error",
+                           "code": "forbidden_for_guest_key"}},
+                status_code=403,
+            )
+        return await call_next(request)
+    if ((API_KEY or GUESTS) and not authz.is_loopback(client)
             and authz.needs_key(request.url.path, request.method)):
-        supplied = authz.extract_key(request.headers.get("authorization"),
-                                     request.headers.get("x-api-key"))
-        if not authz.key_matches(supplied, API_KEY):
+        if not (API_KEY and authz.key_matches(supplied, API_KEY)):
             return JSONResponse(
                 {"error": {"message": "missing or invalid API key "
                            "(Authorization: Bearer <key> or X-Api-Key header)",
@@ -1103,6 +1503,39 @@ async def _require_api_key(request: Request, call_next):
                 status_code=401,
             )
     return await call_next(request)
+
+
+def _guest_for(supplied: str) -> Optional[guests.Guest]:
+    """The guest whose key this is, compared in constant time, or None."""
+    if not supplied:
+        return None
+    for key, g in GUESTS.items():
+        if authz.key_matches(supplied, key):
+            return g
+    return None
+
+
+def _guest(request: Optional[Request]) -> Optional[guests.Guest]:
+    """The guest the middleware found on this request (None for the owner, and
+    for a handler called directly without a request)."""
+    return getattr(getattr(request, "state", None), "guest", None)
+
+
+def _quota_http(e: guests.QuotaExceeded) -> HTTPException:
+    """429 with Retry-After while images are used up; 403 for a key that may
+    make none, since waiting would not change the answer."""
+    logger.warning(f"guest {e.guest.name} refused: {e}")
+    if e.retry_after is None:
+        return HTTPException(status_code=403, detail=str(e))
+    return HTTPException(status_code=429, detail=str(e),
+                         headers={"Retry-After": str(e.retry_after)})
+
+
+# Added to a guest's chat prompt once the allowance is used, so a chat answer
+# does not draw what the image endpoints would refuse. The site can still
+# ignore it; an image that comes back anyway is counted and logged.
+_WORDS_ONLY = ("[Context/Instructions: Answer in words only. Do not create, generate or "
+               "edit any image in this answer.]\n\n")
 
 # Serve saved images so responses can return real links (BROWSER_LLM_IMAGE_DIR).
 if _SAVE_ENABLED:
@@ -1113,6 +1546,11 @@ _WEBUI_DIR = Path(__file__).resolve().parent / "webui"
 _UI_FILE = _WEBUI_DIR / "index.html"
 _WIDGET_FILE = _WEBUI_DIR / "widget.js"
 _WIDGET_DEMO_FILE = _WEBUI_DIR / "widget-demo.html"
+# Fonts the dashboard and widget ship with, so the UI looks the same on a box
+# with no network and no fonts installed. Public, like the pages that use them.
+_ASSETS_DIR = _WEBUI_DIR / "assets"
+if _ASSETS_DIR.is_dir():
+    app.mount("/assets", StaticFiles(directory=str(_ASSETS_DIR)), name="assets")
 
 
 # ---------------------------------------------------------------------------
@@ -1163,19 +1601,81 @@ async def api_design_kinds():
     return {"kinds": design.kinds_catalog(), "direction_groups": sorted(design.DIRECTION)}
 
 
+# What a guest sees of each provider in /api/status: enough for the client
+# tools (busy, can it draw, the site's image counter for a design set's plan),
+# none of the owner's telemetry, whose last_error can quote someone's page.
+_GUEST_STATUS_FIELDS = ("browser_running", "busy", "supports_images", "supports_upload",
+                        "images_allowed", "default", "image_quota", "image_reserve")
+
+
 @app.get("/api/status")
-async def api_status():
+async def api_status(request: Request = None):
     """Lightweight server/provider state for the UI's status bar (no browser I/O)."""
+    body = _status_body()
+    guest = _guest(request)
+    if guest is None:
+        return body
+    return {
+        "ok": True,
+        "version": body["version"],
+        "default_provider": body["default_provider"],
+        "image_providers": body["image_providers"],
+        "providers": {name: {k: v for k, v in p.items() if k in _GUEST_STATUS_FIELDS}
+                      for name, p in body["providers"].items()},
+        # The guest's own allowance: what design sets plan against, and what a
+        # 429 from the image endpoints will cite.
+        "guest": QUOTA.snapshot(guest),
+    }
+
+
+def _lane_rows(name: str) -> list[dict]:
+    """One row per lane for /api/status: what it is doing and how long it has
+    been idle (the extra lanes close at BROWSER_LLM_LANE_IDLE_SECONDS)."""
+    rows = []
+    for row in _pools[name].snapshot():
+        lp = LANES[name][row["lane"]]
+        b = _browsers.get(lp.key)
+        row["number"] = row["lane"] + 1
+        row["browser_running"] = b is not None and not b.stopped
+        row["images_since_recycle"] = _img_gen_count.get(lp.key, 0)
+        rows.append(row)
+    return rows
+
+
+def _status_extra(name: str) -> dict:
+    """The provider's own status fields. They come from the lane that answered
+    last (its picker and its model), except the site's usage counter, which
+    belongs to the account and is taken from whichever lane read it most
+    recently."""
+    group = LANES[name]
+    last = _pools[name].last_lane
+    out = group[last if last is not None else 0].status_extra()
+    best = out.get("image_quota")
+    for lp in group:
+        quota = lp.status_extra().get("image_quota")
+        if quota and (not best or (quota.get("read_at") or 0) > (best.get("read_at") or 0)):
+            out["image_quota"] = best = quota
+    return out
+
+
+def _status_body() -> dict:
     providers = {}
     for name, p in PROVIDERS.items():
         m = _metrics[name]
         b = _browsers.get(name)
+        pool = _pools[name]
         providers[name] = {
             # not just cached — the Chrome process must actually still be alive
             # (b.stopped is a free returncode check, no browser I/O; the deeper
             # CDP-connection probe happens lazily in get_browser per request)
             "browser_running": b is not None and not b.stopped,
-            "busy": _locks[name].locked(),
+            # a request is running (on any lane): what "safe to restart" reads
+            "busy": pool.busy_count() > 0,
+            "lanes_total": pool.size,
+            "lanes_busy": pool.busy_count(),
+            "lanes_running": sum(1 for lane in pool.snapshot() if lane["browser_running"]),
+            "queued": pool.waiting(),
+            "lanes": _lane_rows(name),
             "supports_images": p.supports_images,
             "supports_upload": getattr(p, "supports_upload", False),
             # can its account-side conversation list be read and deleted?
@@ -1192,11 +1692,12 @@ async def api_status():
             "last_error": m["last_error"],
             "last_error_at": m["last_error_at"],
             "last_request_at": m["last_request_at"],
+            "recent": list(m["recent"]),
             # may this provider make images here (IMAGE_PROVIDERS)?
             "images_allowed": name in IMAGE_PROVIDERS,
         }
         try:
-            providers[name].update(p.status_extra())
+            providers[name].update(_status_extra(name))
         except Exception as e:
             logger.debug(f"[{name}] status_extra failed: {e}")
     return {
@@ -1213,9 +1714,11 @@ async def api_status():
 
 
 @app.get("/api/gallery")
-async def api_gallery(provider: Optional[str] = None, limit: int = 60):
+async def api_gallery(provider: Optional[str] = None, limit: int = 60, offset: int = 0):
     """Saved generated images, newest first. ``provider`` accepts a slug
-    ('gemini') or a model name ('gemini-browser'); absent = all providers."""
+    ('gemini') or a model name ('gemini-browser'); absent = all providers.
+    ``offset`` pages through them; each item carries ``record`` when the
+    image endpoints kept one (the brief, kind, words sent, model, size)."""
     if not _SAVE_ENABLED:
         return {"images": [], "image_dir": None}
     want = None
@@ -1245,7 +1748,14 @@ async def api_gallery(provider: Optional[str] = None, limit: int = 60):
         logger.warning(f"gallery listing failed: {e}")
     items.sort(key=lambda x: x["mtime"], reverse=True)
     limit = max(1, min(int(limit or 60), 500))
-    return {"images": items[:limit], "total": len(items), "image_dir": str(_image_dir)}
+    offset = max(0, int(offset or 0))
+    page = items[offset:offset + limit]
+    for it in page:
+        rec = _read_record(_image_dir / it["provider"] / it["file"])
+        if rec:
+            it["record"] = rec
+    return {"images": page, "total": len(items), "offset": offset,
+            "has_more": offset + len(page) < len(items), "image_dir": str(_image_dir)}
 
 
 def _trusted_caller(request: Request) -> bool:
@@ -1274,6 +1784,21 @@ def _require_trusted(request: Request, what: str) -> None:
                    f"Open the dashboard on this server's own address instead.")
 
 
+def _tracked(request: Optional[Request], guest=None) -> bool:
+    """Whether a request's conversation goes in the ledger for the hourly
+    cleanup. Everything except a person's own chat on the dashboard, which is a
+    page on this server's own address (it sends that as its Origin, and keeps
+    its own copy of the chat). curl, scripts, the MCP tools and the desktop app
+    send no Origin; another site's page, such as one carrying the widget, sends
+    its own. A guest's conversation is always tracked."""
+    if guest or request is None:
+        return True
+    origin = (request.headers.get("origin") or "").strip()
+    if not origin or origin == "null":
+        return True
+    return not authz.origin_is_trusted(origin, request.headers.get("host"))
+
+
 def _history_provider(model: Optional[str]):
     """The provider whose account history we are about to touch, or a 4xx/501
     explaining why we can't."""
@@ -1300,14 +1825,18 @@ async def api_history(request: Request, model: Optional[str] = None,
     provider = _history_provider(model)
     limit = max(1, min(int(limit or 200), 1000))
     offset = max(0, int(offset or 0))
-    async with _locks[provider.name]:
+    async with _lane(provider, cold_ok=False) as lane:
         try:
-            browser = await get_browser(provider)
-            async with provider.session_tab(browser) as page:
-                data = await provider.list_conversations(page, limit=limit,
-                                                        offset=offset)
+            browser = await get_browser(lane)
+            async with lane.session_tab(browser) as page:
+                data = await lane.list_conversations(page, limit=limit,
+                                                    offset=offset)
+        except RateLimited as e:
+            # The first page was refused: a pause fixes it, so say that rather
+            # than 502. A refusal after some pages comes back as `warning`.
+            raise HTTPException(status_code=429, detail=str(e))
         except Exception as e:
-            await _evict_dead_browser(provider, e)
+            await _evict_dead_browser(lane, e)
             logger.error(f"[{provider.name}] history read failed: {e}", exc_info=True)
             raise HTTPException(status_code=502, detail=str(e))
     return {"model": provider.name, "limit": limit, "offset": offset, **data}
@@ -1321,11 +1850,11 @@ async def api_conversation(conv_id: str, request: Request,
     pulled at once."""
     _require_trusted(request, "reading a conversation from the account")
     provider = _history_provider(model)
-    async with _locks[provider.name]:
+    async with _lane(provider, cold_ok=False) as lane:
         try:
-            browser = await get_browser(provider)
-            async with provider.session_tab(browser) as page:
-                conv = await provider.fetch_conversation(page, conv_id)
+            browser = await get_browser(lane)
+            async with lane.session_tab(browser) as page:
+                conv = await lane.fetch_conversation(page, conv_id)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
         except RateLimited as e:
@@ -1354,34 +1883,125 @@ async def api_conversations_delete(req: ConversationDeleteRequest, request: Requ
     provider = _history_provider(req.model)
     deleted: list[str] = []
     why: dict = {}
-    async with _locks[provider.name]:
+    async with _lane(provider, cold_ok=False) as lane:
         try:
-            browser = await get_browser(provider)
-            async with provider.session_tab(browser) as page:
+            browser = await get_browser(lane)
+            async with lane.session_tab(browser) as page:
                 # The whole list in one page call. Per-id calls measured ~4s
                 # each, so a 70-chat clear-out held this request open for five
                 # minutes and looked to the operator like nothing happened.
-                deleted, why = await provider.delete_conversations(page, ids)
+                deleted, why = await lane.delete_conversations(page, ids)
         except Exception as e:
-            await _evict_dead_browser(provider, e)
+            await _evict_dead_browser(lane, e)
             logger.error(f"[{provider.name}] conversation delete failed: {e}", exc_info=True)
             raise HTTPException(status_code=502, detail=str(e))
     # The pictures go with the chat. The client can only name the files it saw
     # itself, which for an imported conversation is none of them, so the sweep
     # happens here where the filenames are.
     images: list[str] = []
-    for path in _conversation_images(ids):
+    for path in ([] if req.keep_images else _conversation_images(ids)):
         try:
-            path.unlink()
+            _unlink_saved(path)
             images.append(path.name)
         except FileNotFoundError:
             pass
         except Exception as e:
             logger.warning(f"could not delete {path}: {e}")
-    logger.info(f"[{provider.name}] deleted {len(deleted)}/{len(ids)} conversation(s) "
-                f"and {len(images)} of their image(s)")
-    return {"model": provider.name, "deleted": deleted,
+    gone, why = _split_already_gone(why)
+    LEDGER.forget(deleted + gone)
+    logger.info(f"[{provider.name}] deleted {len(deleted)}/{len(ids)} conversation(s)"
+                + (f", {len(gone)} already gone" if gone else "")
+                + f", and {len(images)} of their image(s)")
+    return {"model": provider.name, "deleted": deleted, "already_gone": gone,
             "failed": list(why), "why": why, "images_deleted": images}
+
+
+def _provider_idle(name: str) -> bool:
+    """Nothing in flight on the provider: no lane busy, nobody queued, no image
+    request holding or waiting at the image gate."""
+    pool = _pools[name]
+    gate = _image_gates.get(name)
+    return (pool.busy_count() == 0 and pool.waiting() == 0
+            and not (gate is not None and gate.locked()))
+
+
+@app.post("/api/conversations/cleanup")
+async def api_conversations_cleanup(req: ConversationCleanupRequest, request: Request):
+    """Delete the conversations this server made on the account (the ledger,
+    see ledger.py) once they are ``older_than`` seconds old. Run hourly by
+    ``browser-llm cleanup`` from a systemd timer.
+
+    Only ids in the ledger are touched, so a person's own chats on the account
+    are safe whatever they are called, and so are the dashboard's (never
+    written down). A conversation a drive is still working in is skipped
+    whatever its age. Saved images stay: they are the caller's output.
+
+    It never waits for a lane. With ``idle_only`` (the default) it answers 409
+    while anything is in flight; without it, 409 only when no lane is free or a
+    request is queued. Between batches it stops early if another request arrives."""
+    _require_trusted(request, "cleaning up conversations on the account")
+    provider = _history_provider(req.model)
+    older = max(0.0, float(req.older_than))
+    due = [i for i in LEDGER.due(older, provider.name) if i not in _live_conversations]
+    report = {"model": provider.name, "older_than": older, "due": len(due),
+              "recorded": len(LEDGER), "dry_run": bool(req.dry_run)}
+    if req.dry_run or not due:
+        return {**report, "ids": due if req.dry_run else [], "deleted": [],
+                "already_gone": [], "failed": [], "why": {}, "stopped": None}
+    if req.idle_only and not _provider_idle(provider.name):
+        raise HTTPException(status_code=409,
+                            detail=f"{provider.name} is working on a request; try again later")
+    deleted: list[str] = []
+    why: dict = {}
+    stopped = None
+    pool = _pools[provider.name]
+    try:
+        async with _lane(provider, cold_ok=False, wait=False) as lane:
+            # A request that arrives meanwhile either queues or starts another
+            # lane; either way the cleanup gives way after the batch in hand.
+            busy_at_start = pool.busy_count()
+            try:
+                browser = await get_browser(lane)
+                async with lane.session_tab(browser) as page:
+                    for k in range(0, len(due), _MAX_BULK_DELETE):
+                        if k and (pool.waiting() or pool.busy_count() > busy_at_start):
+                            stopped = "a request arrived"
+                            break
+                        done, w = await lane.delete_conversations(
+                            page, due[k:k + _MAX_BULK_DELETE])
+                        deleted += done
+                        why.update(w)
+            except Exception as e:
+                await _evict_dead_browser(lane, e)
+                logger.error(f"[{provider.name}] conversation cleanup failed: {e}", exc_info=True)
+                raise HTTPException(status_code=502, detail=str(e))
+    except NoFreeLane as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    gone, why = _split_already_gone(why)
+    malformed = [i for i, reason in why.items() if reason == "malformed id"]
+    LEDGER.forget(deleted + gone + malformed)
+    dropped = LEDGER.failed([i for i in why if i not in malformed])
+    for i in dropped:
+        logger.warning(f"[{provider.name}] gave up deleting {i[:8]}… after "
+                       f"{ledger.MAX_ATTEMPTS} tries: {why.get(i)}")
+    logger.info(f"[{provider.name}] cleanup: deleted {len(deleted)}/{len(due)} recorded "
+                f"conversation(s) older than {older:.0f}s"
+                + (f", {len(gone)} already gone" if gone else "")
+                + (f", {len(why)} failed" if why else "")
+                + (f"; stopped early: {stopped}" if stopped else ""))
+    return {**report, "ids": [], "deleted": deleted, "already_gone": gone,
+            "failed": list(why), "why": why, "stopped": stopped}
+
+
+def _split_already_gone(why: dict) -> tuple[list, dict]:
+    """Take the conversations the site answered 404 for out of the failures.
+
+    A PATCH on a conversation that no longer exists answers 404, so the thread
+    is already off the account: for a delete that is the result asked for, and
+    reporting it as "the server kept some" sent people looking for a fault
+    that was not there (a chat whose thread an earlier clean-up had removed)."""
+    gone = [cid for cid, reason in why.items() if str(reason).startswith("HTTP 404")]
+    return gone, {cid: reason for cid, reason in why.items() if cid not in gone}
 
 
 def _conversation_images(ids: list) -> list[Path]:
@@ -1462,7 +2082,7 @@ async def api_gallery_delete(req: GalleryDeleteRequest, request: Request):
             refused.append(ref)
             continue
         try:
-            target.unlink()
+            _unlink_saved(target)
             deleted.append(ref)
         except FileNotFoundError:
             missing.append(ref)
@@ -1511,6 +2131,48 @@ def _client_may_send_paths(request: Request) -> bool:
                                    request.headers.get("host"))
 
 
+_GONE_PROBE_S = 0.1
+
+
+def _must_queue(name: str) -> bool:
+    """Whether a request arriving now waits for a lane: every lane is busy, or
+    someone is already waiting (and goes first). Only a request that waited is
+    probed by _caller_gone, so one that never queued pays no delay."""
+    return _pools[name].must_queue()
+
+
+async def _caller_gone(request: Optional[Request]) -> bool:
+    """True when the caller has hung up. Asked once a request that had to
+    queue gets a lane: a caller who gave up while waiting would otherwise hold the
+    browser for an answer nobody reads, up to the drive's cap, while everything
+    queued behind it waits.
+
+    ``request.is_disconnected()`` cannot answer this here. Behind the
+    ``@app.middleware("http")`` key check (Starlette's BaseHTTPMiddleware) its
+    receive runs inside a task group, and the already-cancelled scope it uses
+    cancels on that group's exit, dropping the disconnect message, so every
+    caller reads as connected. A short real wait on ``receive()`` lets the
+    group finish: the server hands a caller who hung up ``http.disconnect`` at
+    once, and a timeout means the caller is still there. The body has already
+    been read into the route's model, so nothing else is waiting to arrive. Any
+    other answer, or an error, counts as still there."""
+    if request is None:
+        return False
+    # Twice: a loop busy past the timeout can fire the timer in the same pass
+    # that reads the hang-up, before the server has marked it; one yield
+    # later the server's receive() answers http.disconnect at once.
+    for wait in (_GONE_PROBE_S, 0.01):
+        try:
+            msg = await asyncio.wait_for(request.receive(), wait)
+        except asyncio.TimeoutError:
+            await asyncio.sleep(0)
+            continue
+        except Exception:
+            return False
+        return msg.get("type") == "http.disconnect"
+    return False
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest, request: Request):
     if not req.messages:
@@ -1524,6 +2186,15 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     _prevalidate_specs(specs, allow_local_paths=allow_paths)
     if not prompt.strip() and specs:
         prompt = "Describe this image."  # a bare image with no text still needs a prompt
+    guest = _guest(request)
+    # A guest's conversations never stay in the owner's account.
+    ephemeral = True if guest else _ephemeral(req)
+    # A guest key (an outside party) never sets its own limit: one request
+    # could otherwise hold the one shared tab for an hour (second review).
+    timeout = None if guest else req.timeout
+    track = _tracked(request, guest)
+    if guest and QUOTA.snapshot(guest)["remaining"] <= 0:
+        prompt = _WORDS_ONLY + prompt
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
 
@@ -1560,12 +2231,13 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             # rides out on the closing chunk (see _note_conversation).
             meta: dict = {}
             try:
-                async with _locks[provider.name]:
+                async with _lane(provider) as lane:
                     started = time.monotonic()  # reset: exclude queue-wait
-                    async for chunk in run_chat(provider, prompt, specs,
+                    async for chunk in run_chat(lane, prompt, specs,
                                                 allow_local_paths=allow_paths,
-                                                ephemeral=_ephemeral(req),
-                                                meta=meta, variant=req.model_variant):
+                                                ephemeral=ephemeral,
+                                                meta=meta, variant=req.model_variant,
+                                                timeout=timeout, track=track):
                         yield _chunk(chunk, None)
             except Exception as e:
                 # Surface the failure in-band; a raised exception here would
@@ -1575,6 +2247,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 yield _chunk(f"\n\n[browser-llm error: {e}]", None)
             finally:
                 _record_request(provider.name, started, err)
+                if guest and meta.get("images"):
+                    QUOTA.commit(guest, meta["images"])
             extra = {k: meta[k] for k in ("conversation_id", "model_used") if meta.get(k)}
             yield _chunk(None, "stop", extra or None)
             yield "data: [DONE]\n\n"
@@ -1583,13 +2257,20 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
 
     # --- Non-streaming ---
     meta: dict = {}
-    async with _locks[provider.name]:
+    queued = _must_queue(provider.name)
+    async with _lane(provider) as lane:
+        if queued and await _caller_gone(request):
+            # The caller left while queued: free the browser for the next one.
+            logger.warning(f"[{provider.name}] caller left while queued; "
+                           f"dropped before the drive")
+            raise HTTPException(status_code=499, detail="client closed the request while queued")
         started = time.monotonic()
         try:
-            text, imgs = await drive_once(provider, prompt, specs,
+            text, imgs = await drive_once(lane, prompt, specs,
                                           allow_local_paths=allow_paths,
-                                          ephemeral=_ephemeral(req),
-                                          meta=meta, variant=req.model_variant)
+                                          ephemeral=ephemeral,
+                                          meta=meta, variant=req.model_variant,
+                                          timeout=timeout, track=track)
         except HTTPException:
             _record_request(provider.name, started, RuntimeError("bad request"))
             raise
@@ -1601,6 +2282,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             logger.error(f"[{provider.name}] run failed: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
         _record_request(provider.name, started)
+    if guest and imgs:
+        QUOTA.commit(guest, [Path(im.get("path") or "").name for im in imgs])
     full_text = _compose(text, imgs, provider)
 
     prompt_tokens = sum(len(_message_pieces(m)[0].split()) for m in req.messages)
@@ -1723,8 +2406,14 @@ async def _run_image_request(provider, prompt: str, specs: list, raw: Optional[l
                              response_format: Optional[str], *, allow_local_paths: bool,
                              what: str = "image generation", size: Optional[str] = None,
                              background: Optional[str] = None,
-                             variant: Optional[str] = None):
-    """Shared body of /v1/images/generations and /v1/images/edits."""
+                             variant: Optional[str] = None,
+                             record: Optional[dict] = None,
+                             guest: Optional[guests.Guest] = None,
+                             request: Optional[Request] = None):
+    """Shared body of /v1/images/generations and /v1/images/edits. ``record``
+    is kept beside each saved image (see _write_record). A ``guest`` request
+    takes a place in that guest's allowance before it queues (429 when none is
+    left), gives it back if no image comes, and leaves no conversation behind."""
     if not provider.supports_images:
         raise HTTPException(status_code=501,
                             detail=f"{provider.name} does not support image generation")
@@ -1739,24 +2428,48 @@ async def _run_image_request(provider, prompt: str, specs: list, raw: Optional[l
     _prevalidate_specs(specs, allow_local_paths=allow_local_paths)
     typed = provider.image_prompt(prompt, size=size, background=background)
 
-    meta: dict = {}
-    async with _locks[provider.name]:
-        started = time.monotonic()
+    # Reserve before queueing: two requests sent at once must not both get the
+    # last image of the allowance.
+    token = None
+    if guest:
         try:
-            text, imgs = await drive_once(provider, typed, specs, raw_uploads=raw,
-                                          allow_local_paths=allow_local_paths,
-                                          meta=meta, variant=variant, kind="image")
-        except HTTPException:
-            _record_request(provider.name, started, RuntimeError("bad request"))
-            raise
-        except UsageLimitReached as e:
-            _record_request(provider.name, started, e)
-            raise _limit_http(e)
-        except Exception as e:
-            _record_request(provider.name, started, e)
-            logger.error(f"[{provider.name}] {what} failed: {e}", exc_info=True)
-            raise HTTPException(status_code=500, detail=str(e))
-        _record_request(provider.name, started)
+            token = QUOTA.reserve(guest)
+        except guests.QuotaExceeded as e:
+            raise _quota_http(e)
+    meta: dict = {}
+    try:
+        gate = _image_gates[provider.name]
+        queued = _must_queue(provider.name) or gate.locked()
+        async with gate, _lane(provider) as lane:
+            if queued and await _caller_gone(request):
+                # Left while queued: no drive, and the finally below gives a
+                # guest's reserved image back.
+                logger.warning(f"[{provider.name}] {what}: caller left while queued; "
+                               f"dropped before the drive")
+                raise HTTPException(status_code=499,
+                                    detail="client closed the request while queued")
+            started = time.monotonic()
+            try:
+                text, imgs = await drive_once(lane, typed, specs, raw_uploads=raw,
+                                              allow_local_paths=allow_local_paths,
+                                              ephemeral=bool(guest),
+                                              meta=meta, variant=variant, kind="image",
+                                              track=_tracked(request, guest))
+            except HTTPException:
+                _record_request(provider.name, started, RuntimeError("bad request"))
+                raise
+            except UsageLimitReached as e:
+                _record_request(provider.name, started, e)
+                raise _limit_http(e)
+            except Exception as e:
+                _record_request(provider.name, started, e)
+                logger.error(f"[{provider.name}] {what} failed: {e}", exc_info=True)
+                raise HTTPException(status_code=500, detail=str(e))
+            _record_request(provider.name, started)
+        if guest and imgs:
+            QUOTA.commit(guest, [Path(im.get("path") or "").name for im in imgs], token)
+    finally:
+        QUOTA.release(token)   # no-op once committed
 
     if not imgs:
         # The site's own refusal ("You've hit the Plus plan limit for image
@@ -1770,6 +2483,9 @@ async def _run_image_request(provider, prompt: str, specs: list, raw: Optional[l
             status_code=502,
             detail=f"{provider.name} did not return an image for this prompt.{said}",
         )
+    _write_record(imgs, dict(record or {}, prompt_sent=typed, size=size,
+                             model=provider.name, model_used=meta.get("model_used"),
+                             image_tool=meta.get("image_tool")))
     # prompt_sent: the exact words typed into the site, so a caller can see
     # (and a design manifest can keep) what the image was made from.
     # image_tool: whether the composer was in the site's own image mode.
@@ -1787,13 +2503,16 @@ async def images_generations(req: ImageGenRequest, request: Request):
 
     allow_paths = _client_may_send_paths(request)
     specs = _ref_specs(req)
-    prompt, size, background = _design_prompt(
-        req.prompt, req.model_dump(include=set(_DESIGN_FIELDS)), len(specs),
-        req.size, req.background)
+    dfields = req.model_dump(include=set(_DESIGN_FIELDS))
+    prompt, size, background = _design_prompt(req.prompt, dfields, len(specs),
+                                              req.size, req.background)
     return await _run_image_request(get_provider(req.model), prompt, specs,
                                     None, req.response_format,
                                     allow_local_paths=allow_paths, size=size,
-                                    background=background, variant=req.model_variant)
+                                    background=background, variant=req.model_variant,
+                                    record={"brief": req.prompt, "kind": dfields.get("kind"),
+                                            "references": len(specs)},
+                                    guest=_guest(request), request=request)
 
 
 @app.post("/v1/images/edits")
@@ -1853,12 +2572,16 @@ async def images_edits(request: Request):
         raise HTTPException(status_code=400,
                             detail="no image supplied — send `image` (multipart file, "
                                    "data: URL, http(s) URL, or local path)")
+    brief = prompt
     prompt, size, background = _design_prompt(prompt, dfields, len(specs) + len(raw),
                                               size, background)
 
     return await _run_image_request(get_provider(model), prompt, specs, raw, response_format,
                                     allow_local_paths=allow_paths, what="image edit",
-                                    size=size, background=background, variant=variant)
+                                    size=size, background=background, variant=variant,
+                                    record={"brief": brief, "kind": dfields.get("kind"),
+                                            "references": len(specs) + len(raw)},
+                                    guest=_guest(request), request=request)
 
 
 # ---------------------------------------------------------------------------

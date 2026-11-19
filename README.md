@@ -2,7 +2,7 @@
 
 An OpenAI-compatible API over your signed-in ChatGPT and Gemini web sessions, with design tools that make website sections, app screens and brand images with ChatGPT's image tool.
 
-![MIT License](https://img.shields.io/badge/license-MIT-green) ![Python 3.12](https://img.shields.io/badge/python-3.12-blue) ![Version 2.0](https://img.shields.io/badge/version-2.0.0-8b5cf6)
+![MIT License](https://img.shields.io/badge/license-MIT-green) ![Python 3.12](https://img.shields.io/badge/python-3.12-blue) ![Version 2.1](https://img.shields.io/badge/version-2.1.0-8b5cf6)
 
 Browser LLM API drives a real, logged-in ChatGPT and Gemini session through an automated Chrome ([`nodriver`](https://github.com/ultrafunkamsterdam/nodriver)) and exposes it as the HTTP API your tools already speak. Point any OpenAI SDK, script or agent at `http://localhost:8081/v1` and you get streaming chat, vision, and image generation and editing, on the plan you already pay for, from your own machine.
 
@@ -24,7 +24,7 @@ client.chat.completions.create(
 - **Images.** `/v1/images/generations` and `/v1/images/edits` return a saved file and a link. ChatGPT is put into its own Create image mode for every image request.
 - **Design.** `browser-llm design` makes one large, readable image per website section or app screen, keeps a set in one design system, reads the design back out as CSS tokens, and reviews a screenshot of your build against the design.
 - **Agents.** An MCP server gives Claude Code, Claude Desktop, Cursor or Zed the tools `ask`, `generate_image`, `design_set`, `design_tokens`, `design_review`, `list_models` and `health`.
-- **Interfaces.** A web dashboard with chat history, image creation and a gallery; an embeddable chat widget; and a native Linux tray app.
+- **Interfaces.** A web dashboard with chat history, a Studio for images, a gallery, live server status and a `Ctrl+K` palette; an embeddable chat widget that a page can drive from JavaScript; and a native Linux tray app.
 
 | `model` | Site | Makes images | Takes images in |
 |---|---|---|---|
@@ -33,7 +33,7 @@ client.chat.completions.create(
 
 ### Scope
 
-In scope: one person's or one team's signed-in ChatGPT and Gemini sessions on a Linux machine, one request at a time per provider, used from scripts, agents, the dashboard and the widget. Out of scope: pooling several accounts, parallel requests to one provider, headless Chrome (both sites block it, so a background run uses an Xvfb display), and Windows or macOS, which are untested. Version 2.0 removed forwarding a model from one install to another; a second machine calls this API directly with a key.
+In scope: one person's or one team's signed-in ChatGPT and Gemini sessions on a Linux machine, one request at a time per browser (ChatGPT can run up to eight browsers of the one account, `BROWSER_LLM_LANES`), used from scripts, agents, the dashboard and the widget. Out of scope: pooling several accounts, headless Chrome (both sites block it, so a background run uses an Xvfb display), and Windows or macOS, which are untested. Version 2.0 removed forwarding a model from one install to another; a second machine calls this API directly with a key.
 
 ## Install and first run
 
@@ -122,7 +122,7 @@ Browser LLM API is built by Statotech Systems in partnership with [Ebenworks](ht
 
 ## License
 
-[MIT](LICENSE). The version lives in `browser_llm/_version.py` and shows at `/version`, `/api/status` and in the dashboard footer.
+[MIT](LICENSE). The version lives in `browser_llm/_version.py` and shows at `/version`, `/api/status` and at the foot of the dashboard's rail.
 
 ## Disclaimer
 

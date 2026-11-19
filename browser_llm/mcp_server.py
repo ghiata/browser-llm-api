@@ -50,6 +50,9 @@ SERVER_NAME = "browser-llm"
 BASE = os.environ.get("BROWSER_LLM_API", "http://localhost:8081").rstrip("/")
 API_KEY = os.environ.get("BROWSER_LLM_API_KEY", "").strip()
 DEFAULT_TIMEOUT = int(os.environ.get("BROWSER_LLM_MCP_TIMEOUT", "440"))
+# `ask` waits longer: GPT-6 High can think silently for over seven minutes, and
+# the server keeps waiting while the page shows it working (EBE-7813).
+ASK_TIMEOUT = int(os.environ.get("BROWSER_LLM_MCP_ASK_TIMEOUT", "1500"))
 
 
 _write_lock = threading.Lock()
@@ -60,10 +63,12 @@ def log(msg):
     print(f"[mcp] {msg}", file=sys.stderr, flush=True)
 
 
-def _get(path, timeout=15):
-    req = urllib.request.Request(BASE + path)
-    if API_KEY:
-        req.add_header("Authorization", f"Bearer {API_KEY}")
+def _get(path, timeout=15, base=None, api_key=None):
+    base = BASE if base is None else base
+    api_key = API_KEY if api_key is None else api_key
+    req = urllib.request.Request(base + path)
+    if api_key:
+        req.add_header("Authorization", f"Bearer {api_key}")
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.load(r)
 
@@ -80,7 +85,8 @@ TOOLS = [
             "and get its reply as text. Attach images to have it look at screenshots, "
             "mockups or photos. Every call should demand a finished artifact (a complete "
             "HTML page, a hard critique with the replacement markup) rather than an "
-            "opinion. Text replies take 15-60s at High; model_variant 'instant' is faster."
+            "opinion. Text replies take 15-60s at High, a long brief can think for over "
+            "seven minutes (waited for up to `timeout`); model_variant 'instant' is faster."
         ),
         "inputSchema": {
             "type": "object",
@@ -115,7 +121,9 @@ TOOLS = [
                                    "path is returned instead of the full text, which "
                                    "keeps a large HTML page out of the conversation.",
                 },
-                "timeout": {"type": "integer", "description": "Seconds to wait (default 440)."},
+                "timeout": {"type": "integer",
+                            "description": f"Seconds to wait; also the server's limit for a "
+                                           f"page still thinking (default {ASK_TIMEOUT})."},
                 "keep_chat": {
                     "type": "boolean",
                     "description": "Leave the conversation in the account's history. "
@@ -334,7 +342,7 @@ def tool_ask(args):
         prompt,
         model=args.get("model"),
         system=args.get("system"),
-        timeout=int(args.get("timeout") or DEFAULT_TIMEOUT),
+        timeout=int(args.get("timeout") or ASK_TIMEOUT),
         images=args.get("images") or None,
         # An agent's question is tooling, not conversation: it has no business
         # sitting in the account's chat history afterwards.
@@ -466,12 +474,26 @@ def tool_list_models(_args):
 
 
 def tool_health(_args):
+    from . import client as _client
     try:
         status = _get("/api/status")
     except Exception as e:
-        return (f"UNREACHABLE: {BASE} ({e}). Start it with "
+        status = None
+        head = (f"UNREACHABLE: {BASE} ({e}). Start it with "
                 f"`systemctl --user start browser-llm-api`.")
-    return json.dumps(status, indent=2)
+    else:
+        head = json.dumps(status, indent=2)
+    if not _client.FALLBACK_BASE:
+        return head
+    # The ask tool falls back to a second server; say whether that one is up too.
+    try:
+        fb = _get("/api/status", base=_client.FALLBACK_BASE, api_key=_client.FALLBACK_API_KEY)
+        fb_line = (f"fallback for ask: {_client.FALLBACK_MODEL} at {_client.FALLBACK_BASE} "
+                   f"(v{fb.get('version')}, up)")
+    except Exception as e:
+        fb_line = (f"fallback for ask: {_client.FALLBACK_MODEL} at {_client.FALLBACK_BASE} "
+                   f"UNREACHABLE ({e})")
+    return head + "\n" + fb_line
 
 
 HANDLERS = {

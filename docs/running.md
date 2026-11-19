@@ -61,6 +61,23 @@ systemctl --user list-timers browser-llm-health.timer
 scripts/healthcheck.sh --deep       # run it now, including the daily question
 ```
 
+## Cleaning up the account
+
+Every request opens a new conversation in the signed-in account, and on a busy install that is hundreds of threads a week in the account's own sidebar, burying the chats a person made there. So the server writes down each conversation it makes for a tool (curl, scripts, the MCP server, the widget on another site, a guest key) the moment the site creates it, in `conversations.json` under `BROWSER_LLM_STATE_DIR`. A conversation started from the dashboard is not written down: a person typed it, and deleting the chat in the dashboard deletes its conversations.
+
+`browser-llm cleanup` deletes the written-down conversations that are at least an hour old, and nothing else. Chats a person made in the account itself are never touched, whatever they are called, and neither is a conversation still being answered. Saved images stay on disk. The installer writes a timer for it and turns it on when asked:
+
+```bash
+scripts/install-service.sh --cleanup
+systemctl --user list-timers browser-llm-cleanup.timer
+journalctl --user -u browser-llm-cleanup     # one line per run
+browser-llm cleanup --dry-run                # what would go now
+```
+
+The timer runs every hour, up to five minutes late on purpose. The cleanup never makes a request wait. While anything is in flight the server answers 409 and the command tries again every 30 seconds; after 20 minutes it uses any free browser beside the request, and after 50 it leaves the rest for the next run. Between batches of 200 it stops when another request arrives. A delete the site keeps refusing is retried hourly for a day and then dropped from the list.
+
+An ephemeral request still deletes its own conversation straight away and takes it off the list; the cleanup picks up the ones it misses, such as image requests, a request that timed out and a delete the site refused. A delete cannot be undone, and conversations made before the server kept this list are not covered: delete those from the dashboard, or by exact id through `POST /api/conversations/delete`.
+
 ## Troubleshooting
 
 Read the page before guessing. Each provider's Chrome runs with a debugging port, which `pgrep -af 'user-data-dir=./chatgpt_profile'` shows. The page's `document.visibilityState`, its URL and its composer tell you more than an empty answer does.

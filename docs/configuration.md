@@ -24,11 +24,18 @@ cp .env.example .env      # then edit
 | `BROWSER_LLM_HOST` | `127.0.0.1` | interface to bind; use `0.0.0.0` only together with an API key |
 | `BROWSER_LLM_PORT` | `8081` | port to bind |
 | `BROWSER_LLM_API_KEY` | unset | key required from callers on other machines on `/v1/*` and `/api/*` |
+| `BROWSER_LLM_GUEST_KEYS` | unset | keys for other people, `name:key:images` comma-separated; a guest reaches chat and images only and may make that many images in any 24 hours (see [below](#giving-someone-else-a-key)) |
+| `BROWSER_LLM_STATE_DIR` | `~/.local/state/browser-llm-api` | where the guests' image count and the list of conversations made for tools (`conversations.json`, read by the cleanup) are kept, so a restart does not reset them |
 | `BROWSER_LLM_IMAGE_DIR` | `~/Pictures/browser-llm` | folder for saved images, one subfolder per provider |
 | `BROWSER_LLM_PUBLIC_URL` | `http://localhost:8081` | base of the image links the API returns; set it to this machine's address when others use the links |
 | `BROWSER_LLM_EPHEMERAL` | `0` | delete every chat's conversation afterwards unless the request says otherwise |
+| `BROWSER_LLM_THINKING_DEADLINE` | `1500` | seconds a request may wait while the page still shows the model working with no new text (a long thinking phase); never below the 900 s streaming cap |
+| `BROWSER_LLM_MAX_REQUEST_TIMEOUT` | `3600` | the most a chat request's own `timeout` may ask for; never below `BROWSER_LLM_THINKING_DEADLINE` |
 | `BROWSER_LLM_PREWARM` | `1` | start the default provider's browser at startup; `0` starts none until a request needs one |
-| `BROWSER_RECYCLE_AFTER_IMAGES` | `8` | restart a provider's browser after this many images |
+| `BROWSER_RECYCLE_AFTER_IMAGES` | `8` | restart a browser after this many images (each lane counts its own) |
+| `BROWSER_LLM_LANES` | `1` | browsers per provider, 1 to 8; see [Lanes](#lanes). ChatGPT only: other providers stay at 1 |
+| `BROWSER_LLM_LANE_IDLE_SECONDS` | `600` | an extra lane's browser closes after this long without a request |
+| `BROWSER_LLM_IMAGE_CONCURRENCY` | `1` | image requests allowed to run at once, across lanes; chat is not limited by it |
 | `MAX_ATTACHMENTS` | `6` | most images one request may attach |
 | `MAX_ATTACHMENT_MB` | `20` | size limit per attachment |
 | `ALLOW_REMOTE_FILE_PATHS` | unset | let callers on other machines or other origins attach files by server path |
@@ -43,8 +50,28 @@ Settings for the clients (the CLI, the asset and design tools, the MCP server, t
 | `BROWSER_LLM_MODEL` | `chatgpt-browser` | model for `browser-llm ask` |
 | `BROWSER_LLM_IMAGE_MODEL` | `chatgpt-browser` | model for `browser-llm image` and design sets |
 | `BROWSER_LLM_MCP_TIMEOUT` | `440` | seconds an MCP tool call waits |
+| `BROWSER_LLM_FALLBACK_API` | unset | a second server that `browser-llm ask`, `client.ask()` and the MCP `ask` tool try once when the first one is unreachable, answers 429 or 5xx, or returns nothing |
+| `BROWSER_LLM_FALLBACK_API_KEY` | unset | key for that server, when it has one |
+| `BROWSER_LLM_FALLBACK_MODEL` | `gemini-browser` | model asked on the fallback server |
+
+A fallback covers chat only: images and design never fall back, because the second server is
+usually a Gemini that cannot draw for the account. A request the first server rejected as
+malformed (HTTP 400) is not retried, and a stream that has already delivered text is not either.
+The client prints one line on stderr when it falls back, and the MCP `health` tool reports both
+servers.
 
 Settings for the watchdog: `BLM_ALERT_DIR` writes each alert as a Markdown file into a folder, and `BLM_ALERT_CMD` runs a command per alert with `BLM_ALERT_SEVERITY`, `BLM_ALERT_TITLE`, `BLM_ALERT_BODY` and `BLM_ALERT_KIND` set. See [Running it](running.md#watchdog).
+
+### Lanes
+
+By default a provider has one Chrome and runs one request at a time; the rest wait. `BROWSER_LLM_LANES=3` gives ChatGPT up to three browsers, so up to three requests run together.
+
+- Lane 1 is the browser you already have (`chatgpt_profile/`). Lanes 2 and 3 start only when every running lane is busy, so a quiet server still has one browser. They close after `BROWSER_LLM_LANE_IDLE_SECONDS` without a request.
+- Each extra lane is a separate Chrome with its own profile (`chatgpt_lane2_profile/`) and its own private X display. At start it copies the cookies of lane 1, so it is signed in to the same account without another sign-in. Nothing is copied back, and lane 1's profile is only read.
+- A lane that cannot start, or that the site shows signed out, is left alone for five minutes and the request takes another lane.
+- All lanes use one account, so they share its limits. Concurrent chats count against the same Plus allowance, and ChatGPT may answer 429 if it sees too many at once. `BROWSER_LLM_IMAGE_CONCURRENCY=1` keeps images one at a time, which is the pace the site's image limit was measured at; raise it only after trying it.
+- Each lane needs about 2 GB of memory while it runs. Reading or deleting the account's history uses a lane that is already running and never starts one.
+- `/api/status` shows `lanes_total`, `lanes_busy`, `queued` and one row per lane. `busy` is true while any lane works, so "restart only when nothing is busy" is unchanged.
 
 ### Names that changed in 2.0
 
@@ -62,7 +89,7 @@ The old names still work, and the server logs once which one it found, so nothin
 CORS is open on purpose, because the embeddable widget has to work from any page on your network. That has a consequence: while the server runs, any website open in your browser can send it requests, and they arrive from `127.0.0.1` like any local client. So:
 
 - Treat the port as local trust. Keep the default `127.0.0.1` bind unless you mean to share it, and set `BROWSER_LLM_API_KEY` when you do.
-- Callers on the same machine need no key; callers on other machines do. Pages and images (`/`, `/widget.js`, `/demo`, `/images/...`) stay public so links work in a plain browser, and saved image names are unguessable.
+- Callers on the same machine need no key; callers on other machines do. Pages, images and the UI's fonts (`/`, `/widget.js`, `/demo`, `/images/...`, `/assets/...`) stay public so links work in a plain browser, and saved image names are unguessable.
 - Attaching a file by its path on the server needs a caller on the same machine and the same origin. A path makes the browser upload that file, so a page on another site naming a private file would otherwise read it. A request with no `Origin` header (curl, the CLI, the desktop app) counts as local. `ALLOW_REMOTE_FILE_PATHS=1` turns the check off.
 - The history and delete endpoints answer only the server's own origin, because they read and delete a real account's conversations.
 - Stop the service when you are not using it, if you would rather not have the endpoint live at all.
@@ -84,3 +111,16 @@ browser-llm ask "hello"            # or any OpenAI client with base_url and api_
 ```
 
 Allow the port only from your own network in the firewall, and change the key if it may have leaked. Across networks, a private overlay such as Tailscale works the same way with its addresses.
+
+## Giving someone else a key
+
+`BROWSER_LLM_API_KEY` is the owner's key: it reaches everything, including the account's chat history and the delete endpoints. To let another person use the server, give them a guest key instead:
+
+```bash
+# name:key:images per 24 hours; separate several guests with commas
+BROWSER_LLM_GUEST_KEYS=sam:<a long random key, e.g. from: openssl rand -hex 24>:20
+```
+
+A guest key works from any address and reaches chat, the image endpoints, `/v1/models`, `/api/design/kinds` and a trimmed `/api/status` that shows the guest's own allowance under `guest`. History, the gallery and every delete answer 403. Each image a guest receives counts for 24 hours, whether it came from the image endpoints or was drawn in a chat. When none is left, the image endpoints answer 429 with `Retry-After` and the time the next one frees (an allowance of 0 makes a chat-only key, which gets 403), and chat still answers but is asked to reply in words. A guest's conversations are deleted from the account once the answer is read.
+
+The guest sets the key the same way as the owner's, as `BROWSER_LLM_API_KEY` on their own machine. The count lives in `guest-images.json` under `BROWSER_LLM_STATE_DIR`. A guest's allowance comes out of the same account limit as everyone else's, so the site's own limit can still stop them first.

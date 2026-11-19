@@ -84,6 +84,6 @@ Or the bundled client, which needs only the standard library: `from browser_llm.
 - `model` picks the backend: `chatgpt-browser` (default) or `gemini-browser`. `IMAGE_PROVIDERS` decides which may make images.
 - ChatGPT's model is GPT-6 at High unless `CHATGPT_MODEL` and `CHATGPT_EFFORT` say otherwise. One request can choose with `model_variant`, and each answer reports `model_used`.
 - Limits: on ChatGPT Plus the page's counter allowed 120 images per 24 hours, measured in October 2026. A reached limit comes back as HTTP 429 with the reset time.
-- One request at a time per provider: calls queue; ChatGPT and Gemini run alongside each other. A one-line answer at High took 17 to 23 seconds and an image about a minute, so set generous client timeouts (the bundled client waits 440 seconds).
+- One request at a time per browser: calls queue; ChatGPT and Gemini run alongside each other. With `BROWSER_LLM_LANES` above 1, ChatGPT runs that many requests at once (see [Configuration](configuration.md#lanes)). A one-line answer at High took 17 to 23 seconds and an image about a minute, so set generous client timeouts. A long brief at High can think for over seven minutes: the bundled client and the MCP `ask` tool wait 1500 seconds and send that as the request's `timeout`.
 - Empty replies usually mean the session expired: sign in again. [Running it](running.md#troubleshooting) has the rest.
 - Check generated code: the answer is read from the rendered page, so a very long code block can occasionally lose a character.
